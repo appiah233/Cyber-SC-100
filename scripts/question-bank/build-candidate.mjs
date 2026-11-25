@@ -9,6 +9,7 @@ import react from '@vitejs/plugin-react'
 import { build } from 'vite'
 import { assertOutsideWorktree } from './local-boundary.mjs'
 import { projectProtectedScoring } from './local-score-projection.mjs'
+import { RELEASE_SCOPE, RELEASE_SCORING_SCOPE } from './release-bank.mjs'
 
 const repo = await realpath(fileURLToPath(new URL('../../', import.meta.url)))
 const pinned = new Map([
@@ -18,6 +19,13 @@ const pinned = new Map([
 ])
 const scoringPin = 'fcfae55a1f79077c87839f0a1da863018cdc875ebde8f9f63e966a11e71302ce'
 const version = 'sc100-c1afae23f990-7cab33ce7722'
+// Independently reproduced offline from the pinned PDF, extraction, oracle,
+// assets and review metadata. Do not trust mutable checksums beside input files.
+const releasePins = Object.freeze({
+  version: 'sc100-release-b050d8bdf147ecce012b',
+  display: '9e1aeb5e21e5bb143b10566dd5d5ec949013803982661604c5e79b3428eaa626',
+  scoring: '009df81717ee57bbe8ce516c7aa896c77ef2983881bf0509fe572a2c7a9b6544',
+})
 const contained = (dir, path) => {
   const rel = relative(dir, path)
   return !rel || (rel !== '..' && !rel.startsWith('..' + sep) && !isAbsolute(rel))
@@ -26,7 +34,6 @@ const localOnly = () => {
   if (process.env.CI || process.env.GITHUB_ACTIONS) throw new Error('Protected build is disabled in CI.')
 }
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex')
-const projectionId = 'virtual:local-candidate-display'
 const safeCode = { sourcemap: false, minify: true, emptyOutDir: false, copyPublicDir: false, reportCompressedSize: false }
 
 function localExamTiming(env) {
@@ -62,7 +69,10 @@ async function main() {
   localOnly()
   const examTiming = localExamTiming(process.env)
   const scoringPolicy = localScoringPolicy(process.env)
-  const [, , input, output, ...extra] = process.argv
+  const [mode, ...rest] = process.argv.slice(2)
+  const release = mode === '--release'
+  const [input, output, ...extra] = release ? rest : [mode, ...rest]
+  if (release && (!examTiming || !scoringPolicy)) throw new Error('The protected release needs explicit duration and passing policy.')
   if (!input || !output || extra.length) throw new Error('Supply an external approved bank directory and a new external output directory.')
   const bankDir = await realpath(resolve(input))
   const outDir = join(await realpath(dirname(resolve(output))), basename(resolve(output)))
@@ -79,23 +89,42 @@ async function main() {
     return JSON.parse(bytes.toString('utf8'))
   }
   // Check all input bytes before any browser artifact can be produced.
-  const [bank, display, reference] = await Promise.all([...pinned.keys()].map(name => read(name)))
-  const scoringInput = scoringPolicy ? await read('scoring-bank.json', scoringPin) : undefined
+  const projectionId = release ? 'virtual:local-release-display' : 'virtual:local-candidate-display'
   const scratch = await mkdtemp(join(tmpdir(), 'examination-candidate-'))
   let created = false
   try {
-    const projectionBuild = join(scratch, 'projector')
-    await build({
-      root: repo, configFile: false, publicDir: false, logLevel: 'silent',
-      build: {
-        ...safeCode, ssr: resolve(repo, 'src/data/candidate-reference.ts'), outDir: projectionBuild,
-        minify: false, rolldownOptions: { output: { entryFileNames: 'projection.mjs', format: 'es' } },
-      },
-    })
-    const { prepareCandidateReference } = await import(pathToFileURL(join(projectionBuild, 'projection.mjs')).href)
-    const { assetFiles, ...payload } = prepareCandidateReference(bank, display, reference, version)
+    let payload, assetFiles, sealed
+    if (release) {
+      const [candidate, scoring] = await Promise.all([
+        read('release-bank.json', releasePins.display), read('release-scoring.json', releasePins.scoring),
+      ])
+      if (candidate.scope !== RELEASE_SCOPE || scoring.scope !== RELEASE_SCORING_SCOPE ||
+          candidate.bankVersion !== releasePins.version || scoring.bankVersion !== releasePins.version ||
+          candidate.inventory.version !== releasePins.version || candidate.contentCounts.publicEligible !== 0 ||
+          candidate.inventory.questions.some(question => question.productionEligible) ||
+          candidate.inventory.caseStudies.some(family => family.productionEligible))
+        throw new Error('Invalid protected release scope.')
+      ;({ assetFiles, ...payload } = candidate)
+      sealed = scoring
+    } else {
+      const [bank, display, reference] = await Promise.all([...pinned.keys()].map(name => read(name)))
+      const scoringInput = scoringPolicy ? await read('scoring-bank.json', scoringPin) : undefined
+      const projectionBuild = join(scratch, 'projector')
+      await build({
+        root: repo, configFile: false, publicDir: false, logLevel: 'silent',
+        build: {
+          ...safeCode, ssr: resolve(repo, 'src/data/candidate-reference.ts'), outDir: projectionBuild,
+          minify: false, rolldownOptions: { output: { entryFileNames: 'projection.mjs', format: 'es' } },
+        },
+      })
+      const { prepareCandidateReference } = await import(pathToFileURL(join(projectionBuild, 'projection.mjs')).href)
+      ;({ assetFiles, ...payload } = prepareCandidateReference(bank, display, reference, version))
+      sealed = scoringPolicy ? projectProtectedScoring(payload, bank, scoringInput) : undefined
+    }
     const exhibitSources = new Map()
+    const copiedRasters = new Map()
     let rasterBytes = 0
+    const rasterBudget = (release ? 8 : 2) * 1024 * 1024
     for (const { id, path, checksum } of assetFiles) {
       if (!/^assets\/[A-Za-z0-9][\w-]{0,95}\.png$/.test(path)) throw new Error('Invalid approved exhibit path.')
       const assetPath = join(bankDir, path)
@@ -106,24 +135,34 @@ async function main() {
       const pngSignature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
       if (!bytes.subarray(0, 8).equals(pngSignature) || sha256(bytes) !== checksum) throw new Error('Approved exhibit digest mismatch.')
       rasterBytes += bytes.byteLength
-      if (rasterBytes > 2 * 1024 * 1024) throw new Error('Approved local exhibit budget exceeded.')
-      exhibitSources.set(id, 'data:image/png;base64,' + bytes.toString('base64'))
+      if (rasterBytes > rasterBudget) throw new Error('Approved local exhibit budget exceeded.')
+      if (release) {
+        const name = basename(path)
+        exhibitSources.set(id, 'assets/exhibits/' + name)
+        if (copiedRasters.has(name)) throw new Error('Duplicate validated raster filename.')
+        copiedRasters.set(name, bytes)
+      } else exhibitSources.set(id, 'data:image/png;base64,' + bytes.toString('base64'))
     }
     for (const item of [...Object.values(payload.questions), ...Object.values(payload.contexts)]) {
       for (const asset of item.assets ?? []) {
         const src = exhibitSources.get(asset.id)
+        if (release && !src && asset.label === 'Source exhibit placeholder' && asset.src === undefined) continue
         if (!src) throw new Error('Unresolved approved exhibit.')
         asset.src = src
       }
     }
-    const sealed = scoringPolicy ? projectProtectedScoring(payload, bank, scoringInput) : undefined
     const serialized = JSON.stringify({ ...payload, ...(examTiming ? { examTiming } : {}), ...(scoringPolicy ? { scoringPolicy } : {}) })
-    if (/"(?:rawAnswer|rawExplanation|answerDefinitions|sourceAnswer|expectedAnswer|score|passThreshold|sourceDocumentChecksum)"/i.test(serialized)) {
+    if (/"(?:rawAnswer|rawExplanation|answerDefinitions|definitions|sourceAnswer|expectedAnswer|score|passThreshold|sourceDocumentChecksum)"/i.test(serialized)) {
       throw new Error('Unexpected non-display data.')
     }
     await mkdir(outDir, { mode: 0o700 })
     created = true
-    const runner = resolve(repo, 'src/integration/development-runner.tsx')
+    const runner = resolve(repo, release ? 'src/integration/release-development-runner.tsx' : 'src/integration/development-runner.tsx')
+    if (copiedRasters.size) {
+      const directory = join(outDir, 'assets', 'exhibits')
+      await mkdir(directory, { recursive: true, mode: 0o700 })
+      for (const [name, bytes] of copiedRasters) await writeFile(join(directory, name), bytes, { mode: 0o600, flag: 'wx' })
+    }
     const result = await build({
       root: repo, configFile: false, publicDir: false, base: './', logLevel: 'silent',
       plugins: [
@@ -165,7 +204,10 @@ async function main() {
       await writeFile(join(outDir, 'candidate-scoring.js'), 'export default ' + JSON.stringify(sealed) + ';\n', { mode: 0o600 })
     }
     await Promise.all(['candidate.js', 'candidate.css'].map(name => chmod(join(outDir, name), 0o600)))
-    console.log('Built the protected local candidate: 59 questions, 2 case contexts. ' + (sealed ? 'Separate local-only scoring module; ' : 'Scoring disabled; ') + 'no network delivery or deployment.')
+    const quantity = release
+      ? payload.contentCounts.eligible + ' questions, ' + payload.contentCounts.caseFamilies + ' case contexts, ' + copiedRasters.size + ' approved rasters. '
+      : '59 questions, 2 case contexts. '
+    console.log('Built the protected local candidate: ' + quantity + (sealed ? 'Separate local-only scoring module; ' : 'Scoring disabled; ') + 'no network delivery or deployment.')
   } catch (cause) {
     if (created) await rm(outDir, { recursive: true, force: true })
     throw cause

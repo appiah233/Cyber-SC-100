@@ -5,6 +5,7 @@ import type { GeneratedBatch } from '../domain/batch-engine'
 import type { ScoringBank, ScoringPolicy } from '../domain/scoring'
 import { activeExamCycle, createCycleLifecycle, isCycleLifecycle, transitionCycleLifecycle } from '../domain/cycle-lifecycle'
 import type { CycleLifecycle } from '../domain/cycle-lifecycle'
+import type { JourneyControls } from './candidate-journey'
 import { isCandidateAnswerFor, readDisplayResponse, responseState, toCandidateAnswer } from '../features/exam/question-response'
 
 export interface FoundationSource {
@@ -18,6 +19,8 @@ export interface FoundationSource {
   readonly contentNotice?: string
   readonly examDurationMinutes?: number
   readonly timerWarningMinutes?: readonly number[]
+  readonly journey?: JourneyControls
+  readonly focusOnMount?: boolean
   readonly scoring?: {
     readonly policy: ScoringPolicy
     /** This hook is called only on the verified durable submission boundary. */
@@ -97,18 +100,23 @@ export function recordCandidateScore(attempt: CandidateSnapshot, result: ScoredE
   return transition.ok && transition.attempt.status === 'SCORED' ? withCursor(transition.attempt, 'question') : null
 }
 
+export function newCandidateAttempt(source: FoundationSource, at: number): CandidateSnapshot {
+  const plan = source.batch
+  return withCursor(createAttempt({
+    id: source.attemptId, cycleId: plan.cycleId, batch: plan, optionOrder: plan.optionOrder, interactionKinds: plan.interactionKinds, at,
+  }), 'question')
+}
+
 export function initialCandidate(source: FoundationSource, at: number): { attempt: CandidateSnapshot; cycle: CandidateCycle } {
   const plan = source.batch
   const lifecycle = createCycleLifecycle({
-    id: plan.cycleId, cycleId: plan.cycleId, bankVersion: plan.contentVersion,
+    id: source.journey?.id ?? plan.cycleId, cycleId: plan.cycleId, bankVersion: plan.contentVersion,
     eligibilityPolicy: plan.eligibilityPolicy, createdAt: at,
   })
   const generated = transitionCycleLifecycle(lifecycle, { type: 'GENERATE', batch: plan, at })
   if (!generated.ok) throw new TypeError('The examination batch could not be validated.')
   return {
-    attempt: withCursor(createAttempt({
-      id: source.attemptId, cycleId: plan.cycleId, batch: plan, optionOrder: plan.optionOrder, interactionKinds: plan.interactionKinds, at,
-    }), 'question'),
+    attempt: newCandidateAttempt(source, at),
     cycle: { id: plan.cycleId, contentVersion: plan.contentVersion, lifecycle: generated.state },
   }
 }
@@ -158,11 +166,12 @@ export function candidateValidators(source: FoundationSource) {
   }
 }
 
-export type CandidateEdit = Exclude<FoundationAction, { type: 'TAKE_OVER' | 'RETRY_SAVE' | 'DISCARD_UNSAVED' | 'RETRY_SCORING' }>
+export type CandidateEdit = Exclude<FoundationAction, { type: 'TAKE_OVER' | 'RETRY_SAVE' | 'DISCARD_UNSAVED' | 'RETRY_SCORING' | 'NEXT_EXAM' | 'START_NEW_CYCLE' }>
 export type CandidateChange = { readonly attempt: CandidateSnapshot; readonly cycle: CandidateCycle }
 
 export function isRecoveryAction(action: FoundationAction): action is Exclude<FoundationAction, CandidateEdit> {
   return action.type === 'TAKE_OVER' || action.type === 'RETRY_SAVE' || action.type === 'DISCARD_UNSAVED' || action.type === 'RETRY_SCORING'
+    || action.type === 'NEXT_EXAM' || action.type === 'START_NEW_CYCLE'
 }
 
 /** Snapshot the deliberate action as one CAS. Section lock + next section

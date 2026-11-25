@@ -135,11 +135,14 @@ test('public entry graph must use the public HTML and boot module without privat
   for (const privateId of [
     join(dir, 'src/integration/development-runner.tsx') + '?compiled',
     join(dir, 'src/integration/development-module.d.ts'),
+    join(dir, 'src/integration/release-development-runner.tsx'),
+    join(dir, 'src/integration/release-development-module.d.ts'),
     join(dir, 'src/data/development-bank.ts'),
     join(dir, 'src/data/cycle-inventory.ts'),
     join(dir, 'src/data/candidate-reference.ts'),
     join(dir, 'scripts/question-bank/build-candidate.mjs'),
     '\0' + ['virtual:', 'local-candidate-display'].join(''),
+    '\0' + ['virtual:', 'local-release-display'].join('') + '?compiled',
   ]) {
     assert.deepEqual(inspectPublicGraph([...ordinary, privateId], dir), ['private-module-in-public-graph']);
   }
@@ -169,8 +172,12 @@ test('rejects a private candidate virtual module marker in otherwise allowed dis
 }));
 
 test('candidate visual evidence is not part of the public checkout', () => withDirectory(async dir => {
-  await write(dir, { 'phase5-evidence/screenshots/start.png': 'synthetic image marker' });
-  assert.deepEqual((await inspectPublicBoundary(dir, 'source')).issues, ['unsupported-file-or-directory']);
+  await write(dir, {
+    'phase5-evidence/screenshots/start.png': 'synthetic image marker',
+    'work/phase-7-evidence/notes.md': 'synthetic evidence marker',
+    'release-evidence/start.png': 'synthetic image marker',
+  });
+  assert.deepEqual((await inspectPublicBoundary(dir, 'source')).issues, Array(3).fill('unsupported-file-or-directory'));
 }));
 
 test('blocks protected local scoring by path, route, and retained canary while permitting fictional scoring', () => withDirectory(async dir => {
@@ -188,4 +195,36 @@ test('blocks protected local scoring by path, route, and retained canary while p
   assert.deepEqual((await inspectPublicBoundary(dir, 'dist')).issues, [
     'restricted-bundle-marker', 'restricted-bundle-marker', 'restricted-file-path',
   ]);
+}));
+
+test('blocks protected full-bank artifacts in checkout and copied markers in public output', () => withDirectory(async dir => {
+  const displayScope = ['PRIVATE_RELEASE', 'CANDIDATE_ONLY'].join('_');
+  const answerScope = ['PRIVATE_RELEASE', 'CANDIDATE_SCORING_ONLY'].join('_');
+  const auditScope = ['PRIVATE_RELEASE', 'CANDIDATE_AUDIT_ONLY'].join('_');
+  const manifestScope = ['PRIVATE_RELEASE', 'CANDIDATE_MANIFEST_ONLY'].join('_');
+  await write(dir, {
+    'documents/release-bank.json': '{}',
+    'public/RELEASE_scoring.JSON': '{}',
+    'evidence/release-audit.json': '{}',
+    'evidence/release-manifest.json': '{}',
+    'notes/display-copy.json': JSON.stringify({ manifest: { scope: displayScope } }),
+    'notes/answer-copy.json': JSON.stringify({ scope: answerScope }),
+    'notes/audit-copy.json': JSON.stringify({ scope: auditScope }),
+    'notes/manifest-copy.json': JSON.stringify({ scope: manifestScope }),
+  });
+  assert.deepEqual((await inspectPublicBoundary(dir, 'source')).issues, [
+    ...Array(4).fill('restricted-file-path'), ...Array(4).fill('restricted-private-projection'),
+  ]);
+  const dist = join(dir, 'dist');
+  await write(dist, {
+    'index.html': '<script type="module" src="./assets/index.js"></script>',
+    'assets/index.js': 'export const practice = true;',
+    'assets/display.js': 'export const label = "' + displayScope + '";',
+    'assets/scoring.js': 'export const label = "' + answerScope + '";',
+    'assets/audit.js': 'export const label = "' + auditScope + '";',
+    'assets/manifest.js': 'export const label = "' + manifestScope + '";',
+    'assets/loader.js': 'export const local = "' + ['virtual:', 'local-release-display'].join('') + '";',
+    'assets/route.js': 'export const local = "' + ['release','bank.json'].join('-') + '";',
+  });
+  assert.deepEqual((await inspectPublicBoundary(dist, 'dist')).issues, Array(6).fill('restricted-bundle-marker'));
 }));

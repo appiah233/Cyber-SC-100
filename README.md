@@ -16,3 +16,5 @@ The [adaptive batch policy](docs/ADAPTIVE-BATCH-EXHAUSTION.md) defines 59 as the
 See [Phase 6 interaction and exam lifecycle guidance](docs/PHASE-6-INTERACTIONS-AND-FINALIZATION.md) for controls, the optional configured deadline, and the no-live-scoring boundary.
 
 See [Phase 7 scoring and results](docs/PHASE-7-SCORING-AND-RESULTS.md) for the scoring policy, result boundary, and isolated local verification.
+
+See [release content and Pages](docs/RELEASE-CONTENT-AND-PAGES.md) for the eligibility and publication boundaries and the deployment approval gate.

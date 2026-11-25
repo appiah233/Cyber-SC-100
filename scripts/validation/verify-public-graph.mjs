@@ -4,8 +4,8 @@ import process from 'node:process';
 import { fileURLToPath, URL } from 'node:url';
 
 const filesOfInterest = new Set(['index.html', 'src/main.tsx']);
-const protectedModules = /^(?:(?:src\/integration\/(?:development-runner|development-module)|src\/data\/(?:development-bank|cycle-inventory|candidate-reference))(?:\.[^/]*)?$|scripts\/question-bank(?:\/|$))/i;
-const protectedVirtual = /(?:^|\/)virtual:local-candidate-display(?:$|[?#])/i;
+const protectedModules = /^(?:(?:src\/integration\/(?:release-)?development-(?:runner|module)|src\/data\/(?:development-bank|cycle-inventory|candidate-reference))(?:\.[^/]*)?$|scripts\/question-bank(?:\/|$))/i;
+const protectedVirtual = /(?:^|\/)virtual:local-(?:candidate|release)-display(?:$|[?#])/i;
 
 const slashes = (value) => value.replaceAll('\\', '/');
 

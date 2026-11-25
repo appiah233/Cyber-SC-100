@@ -78,6 +78,8 @@ export interface InitializeExam<A extends AttemptSnapshot, C extends CycleSnapsh
   readonly writerId: string;
   /** Required to update an already-existing cycle atomically with a new attempt. */
   readonly expectedCycleRevision?: number;
+  /** Create the current attempt, cycle, and journey pointer in one transaction. */
+  readonly journeyId?: string;
 }
 
 export interface SaveExam<A extends AttemptSnapshot, C extends CycleSnapshot> {
@@ -88,9 +90,22 @@ export interface SaveExam<A extends AttemptSnapshot, C extends CycleSnapshot> {
   readonly cycleUpdate?: { readonly cycle: C; readonly expectedRevision: number };
 }
 
+export interface AdvanceJourney<A extends AttemptSnapshot, C extends CycleSnapshot> {
+  readonly journeyId: string;
+  readonly attemptId: string;
+  readonly expectedRevision: number;
+  readonly expectedCycleRevision: number;
+  readonly lease: WriterLease;
+  readonly next: { readonly attempt: A; readonly cycle: C };
+  readonly validateNext: Pick<RepositoryOptions<A, C>, 'validateAttempt' | 'validateCycle' | 'validatePair'>;
+  readonly canAdvance: (attempt: A, cycle: C) => boolean;
+}
+
 export interface ExamRepository<A extends AttemptSnapshot, C extends CycleSnapshot> {
   initialize(input: InitializeExam<A, C>): Promise<WriterLease>;
   load(attemptId: string, expectedContentVersion?: string): Promise<SavedExam<A, C> | null>;
+  loadJourney(journeyId: string, expectedContentVersion: string): Promise<SavedExam<A, C> | null>;
+  advanceJourney(input: AdvanceJourney<A, C>): Promise<WriterLease>;
   acquireWriter(
     attemptId: string,
     writerId: string,
@@ -117,9 +132,17 @@ interface CycleRecord<C> {
 }
 
 export const EXAM_STORAGE_DATABASE = 'examination-hub:Cyber-SC-100:foundation';
-const SCHEMA_VERSION = 1;
+interface JourneyRecord {
+  readonly id: string;
+  readonly attemptId: string;
+  readonly cycleId: string;
+  readonly contentVersion: string;
+}
+
+const SCHEMA_VERSION = 2;
 const ATTEMPTS = 'attempts';
 const CYCLES = 'cycles';
+const JOURNEYS = 'journeys';
 
 function asStorageError(error: unknown): StorageError {
   if (error instanceof StorageError) return error;
@@ -162,6 +185,9 @@ function openDatabase(factory: IDBFactory, name: string): Promise<IDBDatabase> {
       }
       if (!request.result.objectStoreNames.contains(CYCLES)) {
         request.result.createObjectStore(CYCLES, { keyPath: 'id' });
+      }
+      if (!request.result.objectStoreNames.contains(JOURNEYS)) {
+        request.result.createObjectStore(JOURNEYS, { keyPath: 'id' });
       }
     };
     request.onsuccess = () => {
@@ -247,7 +273,7 @@ export function createExamRepository<
 
   async function run<T>(
     mode: IDBTransactionMode,
-    work: (attempts: IDBObjectStore, cycles: IDBObjectStore) => Promise<T>,
+    work: (attempts: IDBObjectStore, cycles: IDBObjectStore, journeys: IDBObjectStore) => Promise<T>,
   ): Promise<T> {
     let database: IDBDatabase | undefined;
     try {
@@ -255,13 +281,13 @@ export function createExamRepository<
       if (closed || !factory) throw new StorageError('UNAVAILABLE');
       database = await openDatabase(factory, name);
       if (closed) throw new StorageError('UNAVAILABLE');
-      const transaction = database.transaction([ATTEMPTS, CYCLES], mode);
+      const transaction = database.transaction([ATTEMPTS, CYCLES, JOURNEYS], mode);
       // Attach to completion before issuing requests. Do not acknowledge a save until commit.
       const done = transactionDone(transaction);
       // Avoid an unhandled rejection if the transaction errors before work has settled.
       void done.catch(() => undefined);
       try {
-        const result = await work(transaction.objectStore(ATTEMPTS), transaction.objectStore(CYCLES));
+        const result = await work(transaction.objectStore(ATTEMPTS), transaction.objectStore(CYCLES), transaction.objectStore(JOURNEYS));
         await done;
         return result;
       } catch (error) {
@@ -321,6 +347,27 @@ export function createExamRepository<
     if (validate) checkExtra({ attempt, cycle }, (pair) => validate(pair.attempt, pair.cycle));
   }
 
+  async function readJourney(store: IDBObjectStore, id: string, version?: string): Promise<JourneyRecord | null> {
+    if (!text(id)) throw new StorageError('CORRUPT');
+    const value: unknown = await requestResult(store.get(id));
+    if (value === undefined) return null;
+    if (!object(value) || value.id !== id || !text(value.attemptId) || !text(value.cycleId) || !text(value.contentVersion)) {
+      throw new StorageError('CORRUPT');
+    }
+    if (version !== undefined && value.contentVersion !== version) throw new StorageError('CONTENT_VERSION_MISMATCH');
+    return { id, attemptId: value.attemptId, cycleId: value.cycleId, contentVersion: value.contentVersion };
+  }
+
+  async function getSaved(record: AttemptRecord<A>, cycles: IDBObjectStore): Promise<SavedExam<A, C>> {
+    const cycle = await readCycle(cycles, record.attempt.cycleId);
+    if (!cycle || cycle.contentVersion !== record.contentVersion) throw new StorageError('CORRUPT');
+    checkPair(record.attempt, cycle.cycle);
+    return {
+      attempt: record.attempt, cycle: cycle.cycle, contentVersion: record.contentVersion,
+      cycleRevision: cycle.revision, lease: record.lease,
+    };
+  }
+
   function issueLease(writerId: string, token: number, timestamp: number): WriterLease {
     const expiry = timestamp + duration;
     if (!text(writerId) || !revision(token) || token === 0 || !Number.isFinite(expiry)) {
@@ -338,7 +385,7 @@ export function createExamRepository<
 
   return {
     initialize(input) {
-      return run('readwrite', async (attempts, cycles) => {
+      return run('readwrite', async (attempts, cycles, journeys) => {
         checkAttempt<A>(input.attempt, options.validateAttempt);
         checkCycle<C>(input.cycle, options.validateCycle);
         checkPair(input.attempt, input.cycle);
@@ -347,8 +394,14 @@ export function createExamRepository<
         }
         checkEmbeddedVersion(input.attempt, input.contentVersion);
         checkEmbeddedVersion(input.cycle, input.contentVersion);
-        if (await readAttempt(attempts, input.attempt.id)) throw new StorageError('ALREADY_EXISTS');
+        if (input.journeyId !== undefined) {
+          const link = await readJourney(journeys, input.journeyId, input.contentVersion);
+          if (link) throw new StorageError('ALREADY_EXISTS');
+          // An existing row with a lost journey pointer is not a fresh visit.
+          if (await requestResult(attempts.count(input.attempt.id))) throw new StorageError('CORRUPT');
+        } else if (await readAttempt(attempts, input.attempt.id)) throw new StorageError('ALREADY_EXISTS');
         const currentCycle = await readCycle(cycles, input.cycle.id);
+        if (input.journeyId !== undefined && currentCycle) throw new StorageError('CORRUPT');
         if (currentCycle && currentCycle.contentVersion !== input.contentVersion) {
           throw new StorageError('CONTENT_VERSION_MISMATCH');
         }
@@ -369,6 +422,9 @@ export function createExamRepository<
           lastToken: lease.token,
           lease,
         } satisfies AttemptRecord<A>));
+        if (input.journeyId !== undefined) await requestResult(journeys.add({
+          id: input.journeyId, attemptId: input.attempt.id, cycleId: input.attempt.cycleId, contentVersion: input.contentVersion,
+        } satisfies JourneyRecord));
         return lease;
       });
     },
@@ -377,16 +433,55 @@ export function createExamRepository<
       return run('readonly', async (attempts, cycles) => {
         const record = await readAttempt(attempts, attemptId, expectedContentVersion);
         if (!record) return null;
-        const cycle = await readCycle(cycles, record.attempt.cycleId);
-        if (!cycle || cycle.contentVersion !== record.contentVersion) throw new StorageError('CORRUPT');
-        checkPair(record.attempt, cycle.cycle);
-        return {
-          attempt: record.attempt,
-          cycle: cycle.cycle,
-          contentVersion: record.contentVersion,
-          cycleRevision: cycle.revision,
-          lease: record.lease,
-        };
+        return getSaved(record, cycles);
+      });
+    },
+
+    loadJourney(journeyId, expectedContentVersion) {
+      return run('readonly', async (attempts, cycles, journeys) => {
+        const link = await readJourney(journeys, journeyId, expectedContentVersion);
+        if (!link) return null;
+        const record = await readAttempt(attempts, link.attemptId, link.contentVersion);
+        if (!record || record.attempt.cycleId !== link.cycleId) throw new StorageError('CORRUPT');
+        return getSaved(record, cycles);
+      });
+    },
+
+    advanceJourney(input) {
+      return run('readwrite', async (attempts, cycles, journeys) => {
+        const link = await readJourney(journeys, input.journeyId);
+        if (!link) throw new StorageError('CORRUPT');
+        if (link.attemptId !== input.attemptId) throw new StorageError('STALE_REVISION');
+        const row = await readAttempt(attempts, link.attemptId, link.contentVersion);
+        if (!row || row.attempt.cycleId !== link.cycleId) throw new StorageError('CORRUPT');
+        const current = await getSaved(row, cycles);
+        assertWriter(row, input.lease, now());
+        if (current.attempt.revision !== input.expectedRevision) throw new StorageError('STALE_REVISION');
+        if (current.cycleRevision !== input.expectedCycleRevision) throw new StorageError('CYCLE_CONFLICT');
+        checkExtra(current, ({ attempt, cycle }) => input.canAdvance(attempt, cycle));
+
+        const { attempt, cycle } = input.next;
+        checkAttempt<A>(attempt, input.validateNext.validateAttempt);
+        checkCycle<C>(cycle, input.validateNext.validateCycle);
+        const nextPair = input.validateNext.validatePair;
+        if (nextPair) checkExtra({ attempt, cycle }, (entry) => nextPair(entry.attempt, entry.cycle));
+        checkEmbeddedVersion(attempt, link.contentVersion);
+        checkEmbeddedVersion(cycle, link.contentVersion);
+        if (attempt.cycleId !== cycle.id || attempt.id === row.id || attempt.revision !== 0
+          || await requestResult(attempts.count(attempt.id))) throw new StorageError('CYCLE_CONFLICT');
+        const sameCycle = cycle.id === current.cycle.id;
+        if (!sameCycle && await requestResult(cycles.count(cycle.id))) throw new StorageError('CYCLE_CONFLICT');
+
+        const lease = issueLease(row.lease!.writerId, 1, now());
+        await requestResult(cycles.put({ id: cycle.id, contentVersion: link.contentVersion,
+          cycle, revision: sameCycle ? nextRevision(current.cycleRevision) : 0,
+        } satisfies CycleRecord<C>));
+        await requestResult(attempts.add({ id: attempt.id, contentVersion: link.contentVersion,
+          attempt, lastToken: lease.token, lease,
+        } satisfies AttemptRecord<A>));
+        await requestResult(attempts.put({ ...row, lease: null }));
+        await requestResult(journeys.put({ ...link, attemptId: attempt.id, cycleId: cycle.id } satisfies JourneyRecord));
+        return lease;
       });
     },
 
