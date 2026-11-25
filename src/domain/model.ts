@@ -123,7 +123,10 @@ export const NORMAL_SECTIONS = Object.freeze([
   Object.freeze({ kind: 'FINAL_INTERACTIVE_BLOCK' as const, count: 4 }),
 ])
 
-export type ExamSectionKind = (typeof NORMAL_SECTIONS)[number]['kind']
+export type NormalExamSectionKind = (typeof NORMAL_SECTIONS)[number]['kind']
+export type ExamSectionKind = NormalExamSectionKind | 'REMAINDER_CASE_STUDY' | 'REMAINDER_UNSECTIONED'
+export type ExamSectionKey = ExamSectionKind | `REMAINDER_CASE_STUDY:${string}`
+export type ExamBatchMode = 'NORMAL' | 'ADAPTIVE' | 'FINAL_REMAINDER'
 export const NORMAL_QUESTION_COUNT = NORMAL_SECTIONS.reduce((total, section) => total + section.count, 0)
 
 export interface ExamSection {
@@ -138,6 +141,7 @@ export interface ExamBatch {
   readonly seed: Seed
   readonly sections: readonly ExamSection[]
   readonly mode?: 'REFERENCE' | 'DEVELOPMENT' | 'PRODUCTION'
+  readonly batchMode?: ExamBatchMode
 }
 
 export interface ExamCycle {
@@ -180,6 +184,8 @@ export type AttemptStatus =
   | 'CASE_STUDY_2_IN_PROGRESS' | 'CASE_STUDY_2_SUBMITTED'
   | 'STANDARD_BLOCK_IN_PROGRESS' | 'STANDARD_BLOCK_SUBMITTED'
   | 'INTERACTIVE_BLOCK_IN_PROGRESS' | 'INTERACTIVE_BLOCK_SUBMITTED'
+  | 'REMAINDER_CASE_STUDY_IN_PROGRESS' | 'REMAINDER_CASE_STUDY_SUBMITTED'
+  | 'REMAINDER_UNSECTIONED_IN_PROGRESS' | 'REMAINDER_UNSECTIONED_SUBMITTED'
   | 'FINAL_SUBMISSION_PENDING' | 'SUBMITTED' | 'SCORED'
 
 export interface ExamAttempt {
@@ -189,9 +195,9 @@ export interface ExamAttempt {
   readonly contentVersion: ContentVersion
   readonly revision: number
   readonly status: AttemptStatus
-  readonly activeSection: ExamSectionKind | null
+  readonly activeSection: ExamSectionKey | null
   readonly position: number
-  readonly locks: readonly ExamSectionKind[]
+  readonly locks: readonly ExamSectionKey[]
   readonly answers: Readonly<Partial<Record<SourceQuestionId, CandidateAnswer>>>
   readonly reviewMarks: Readonly<Partial<Record<SourceQuestionId, boolean>>>
   readonly optionOrder: Readonly<Partial<Record<SourceQuestionId, readonly OptionId[]>>>

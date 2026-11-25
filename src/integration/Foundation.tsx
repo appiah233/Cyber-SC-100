@@ -2,6 +2,7 @@ import { Component, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import App from '../app/App'
 import type { FoundationAction, FoundationPreview } from '../app/App'
+import { examSectionKey } from '../domain'
 import { readDisplayResponse } from '../features/exam/question-response'
 import { createExamRepository, StorageError } from '../storage'
 import type { SavedExam, WriterLease } from '../storage'
@@ -326,8 +327,10 @@ function CandidateSession({ source }: { source: FoundationSource }) {
   const hasStarted = Boolean(attempt && attempt.status !== 'CREATED' && attempt.status !== 'READY')
   const active = attempt ? candidateSection(attempt) : undefined
   const section = active ?? source.batch.sections[attempt?.locks.length ?? 0]
+  const sectionId = section ? examSectionKey(section) : ''
   const complete = attempt?.status === 'SUBMITTED'
-  const final = attempt?.status === 'FINAL_SUBMISSION_PENDING' || attempt?.status === 'INTERACTIVE_BLOCK_SUBMITTED'
+  const final = attempt?.status === 'FINAL_SUBMISSION_PENDING'
+    || Boolean(attempt && atIntermediateBoundary(attempt) && attempt.locks.length === attempt.batch.sections.length)
   let view: NonNullable<FoundationPreview['view']> = state.error ? 'error' : complete ? 'complete'
     : final ? 'final' : !hasStarted ? 'intro' : !active ? 'intro'
     : attempt?.candidateView === 'review' ? 'review' : 'question'
@@ -355,11 +358,16 @@ function CandidateSession({ source }: { source: FoundationSource }) {
   }, [view, reconcileRoute])
 
   const basic: FoundationPreview = {
-    sections: source.batch.sections.map((item) => ({
-      id: item.kind, label: sectionTitles[item.kind], count: item.questionIds.length,
-      state: attempt?.locks.includes(item.kind) ? 'locked' : item.kind === section?.kind ? 'current' : 'upcoming',
-    })),
-    activeSectionId: section?.kind ?? '',
+    sections: source.batch.sections.map((item) => {
+      const id = examSectionKey(item)
+      const label = item.kind === 'REMAINDER_CASE_STUDY' ? 'Case Study'
+        : item.kind === 'REMAINDER_UNSECTIONED' ? 'Other Questions' : sectionTitles[item.kind]
+      return { id, kind: item.kind, label, count: item.questionIds.length,
+        state: attempt?.locks.includes(id) ? 'locked' : id === sectionId ? 'current' : 'upcoming',
+      }
+    }),
+    activeSectionId: sectionId,
+    batchMode: source.batch.batchMode,
     questions: [],
     position: attempt?.position ?? 0,
     view,
@@ -383,9 +391,15 @@ function CandidateSession({ source }: { source: FoundationSource }) {
   try {
     if (active && attempt && (view === 'question' || view === 'review')) {
       const questions = active.questionIds.map((id) => candidateQuestion(source, id))
+      const questionId = view === 'question' ? active.questionIds[attempt.position] : undefined
+      // A normal allocation can place a dual-approved case child in another
+      // section. Keep its approved source context without changing its role,
+      // order, interaction, or the section submission rules.
+      const sourceCases = source.batch.sourceCaseStudyIds
+      const contextId = active.caseStudyId ?? (questionId && Object.hasOwn(sourceCases, questionId) ? sourceCases[questionId] : undefined)
       preview = {
         ...basic, questions,
-        context: active.caseStudyId ? source.context?.(active.caseStudyId) : undefined,
+        context: contextId ? source.context?.(contextId) : undefined,
         answers: Object.fromEntries(questions.flatMap(({ id, interaction }) => {
           const display = readDisplayResponse(interaction, attempt.answers[id])
           return display ? [[id, display]] : []

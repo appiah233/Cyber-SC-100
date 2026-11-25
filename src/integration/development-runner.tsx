@@ -11,6 +11,9 @@ createRoot(root).render(
     attemptId: 'protected-reference-candidate-v1',
     idbName: 'examination-hub-reference-development-v1',
     batch,
+    // The pinned exact-reference generator rejects plans that do not cover
+    // the full approved development inventory. Only then is exhaustion known.
+    eligibleSourceIds: batch.sourceIds,
     examTitle: 'SC-100 Practice Examination',
     contentNotice: 'Protected local development copy. Do not upload or share this practice content. This is not an official certification exam.',
     synthetic: false,

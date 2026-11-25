@@ -1,5 +1,5 @@
 import { allocateRoles } from './batch-allocation'
-import { prepareBatchInventory } from './batch-engine'
+import { generateBatch, prepareBatchInventory } from './batch-engine'
 import type { BatchGenerationInput } from './batch-engine'
 import { NORMAL_QUESTION_COUNT, NORMAL_SECTIONS } from './model'
 import type { ExamSection, SourceQuestionId } from './model'
@@ -31,11 +31,20 @@ export interface CapacityRemainderProjection {
 export type CycleCapacityResult =
   | {
     readonly ok: true
+    /** Compatibility alias for the maximum number of normal batches. */
     readonly maximumFullBatches: number
+    readonly maximumNormalFullBatches: number
+    readonly adaptiveFullBatches: number
+    readonly finalRemainderSize: number
+    readonly totalEligibleQuestions: number
     readonly limitingConstraints: readonly CapacityConstraint[]
     readonly independentBounds: CycleCapacityBounds
     /** Existence proof, not the order or choices promised by a seeded generator. */
     readonly witness: readonly (readonly ExamSection[])[]
+    readonly adaptiveWitness: readonly (readonly ExamSection[])[]
+    /** Inventory after normal batches, including future adaptives. */
+    readonly afterNormalInventory: CapacityRemainderProjection
+    /** Projected short final exam, not a guarantee of its identities for a different seed. */
     readonly anticipatedRemainder: CapacityRemainderProjection
     readonly diagnostics: Diagnostics
   }
@@ -207,6 +216,10 @@ function materializeWitness(
   return Object.freeze(witness)
 }
 
+function projection(ids: readonly SourceQuestionId[]): CapacityRemainderProjection {
+  return Object.freeze({ sourceIds: Object.freeze([...ids]), size: ids.length })
+}
+
 /**
  * Exact maximum of pairwise disjoint normal batches under the generator's
  * prepared eligibility, not a forecast for any particular sequence of seeds.
@@ -214,11 +227,22 @@ function materializeWitness(
  * by 2k family appearances at k <= floor(eligible/59); at small bank size it
  * prunes without rebuilding the question graph. One flow materializes a
  * witness. For pathological metadata with many families the vector search
- * remains combinatorial; it is not mislabeled as a linear-time solver.
+ * remains combinatorial. The balance can be partitioned into adaptive full
+ * batches and one short final exam without any remaining role quota.
  */
 export function analyzeCycleCapacity(input: CycleCapacityInput): CycleCapacityResult {
   const prepared = prepareBatchInventory(input)
-  if (!prepared.ok) return { ok: false, reason: prepared.reason, diagnostics: prepared.diagnostics }
+  if (!prepared.ok) {
+    if (prepared.reason !== 'CYCLE_EXHAUSTED') return { ok: false, reason: prepared.reason, diagnostics: prepared.diagnostics }
+    const empty = projection([])
+    return Object.freeze({
+      ok: true, maximumFullBatches: 0, maximumNormalFullBatches: 0, adaptiveFullBatches: 0, finalRemainderSize: 0,
+      totalEligibleQuestions: 0, limitingConstraints: Object.freeze(['TOTAL_ELIGIBLE' as const]),
+      independentBounds: Object.freeze({ caseStudy: 0, standard: 0, interactive: 0, totalEligible: 0 }),
+      witness: Object.freeze([]), adaptiveWitness: Object.freeze([]), afterNormalInventory: empty,
+      anticipatedRemainder: empty, diagnostics: prepared.diagnostics,
+    })
+  }
   const { inventory, diagnostics } = prepared
   const { families, standardPool, interactivePool, globalUnion } = indexInventory(inventory)
   const canonical = new Set<SourceQuestionId>()
@@ -255,17 +279,36 @@ export function analyzeCycleCapacity(input: CycleCapacityInput): CycleCapacityRe
     ? ['OVERLAPPING_POOLS']
     : bounds.filter(([, count]) => count === maximumFullBatches).map(([role]) => role)
   const used = new Set(witness.flatMap((batch) => batch.flatMap((section) => section.questionIds)))
-  const sourceIds = Object.freeze(inventory.eligibleQuestions
-    .map(({ sourceId }) => sourceId)
-    .filter((sourceId) => !used.has(sourceId))
-    .sort(stableOrder))
+  const sourceIds = inventory.eligibleIds.filter((id) => !used.has(id))
+  const adaptiveFullBatches = Math.floor(sourceIds.length / NORMAL_QUESTION_COUNT)
+  const finalRemainderSize = sourceIds.length % NORMAL_QUESTION_COUNT
+  const adaptiveWitness: (readonly ExamSection[])[] = []
+  // Removing questions cannot re-create a normal assignment. Use the same
+  // seeded allocator to provide a real partition instead of inventing IDs.
+  for (let index = 0; index < adaptiveFullBatches; index += 1) {
+    const plan = generateBatch({
+      ...input, seed: 'capacity-adaptive-witness-v1',
+      cycleState: { ...input.cycleState, consumedSourceIds: [...input.cycleState.consumedSourceIds, ...used] },
+    })
+    if (!plan.ok || plan.batch.kind !== 'ADAPTIVE_BATCH') {
+      return { ok: false, reason: 'CAPACITY_INVARIANT_VIOLATION', diagnostics }
+    }
+    adaptiveWitness.push(plan.batch.sections)
+    plan.batch.sourceIds.forEach((id) => used.add(id))
+  }
   return Object.freeze({
     ok: true,
     maximumFullBatches,
+    maximumNormalFullBatches: maximumFullBatches,
+    adaptiveFullBatches,
+    finalRemainderSize,
+    totalEligibleQuestions: inventory.eligibleIds.length,
     limitingConstraints: Object.freeze(limitingConstraints),
     independentBounds,
     witness,
-    anticipatedRemainder: Object.freeze({ sourceIds, size: sourceIds.length }),
+    adaptiveWitness: Object.freeze(adaptiveWitness),
+    afterNormalInventory: projection(sourceIds),
+    anticipatedRemainder: projection(sourceIds.filter((id) => !used.has(id))),
     diagnostics,
   })
 }

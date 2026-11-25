@@ -1,6 +1,6 @@
 import { allocateRoles } from './batch-allocation'
-import { NORMAL_SECTIONS } from './model'
-import type { ExamBatch, ExamSection, QuestionInteraction, Seed } from './model'
+import { NORMAL_QUESTION_COUNT, NORMAL_SECTIONS } from './model'
+import type { ExamBatch, ExamSection, NormalExamSectionKind, QuestionInteraction, Seed } from './model'
 import { seededQuestionOrder } from './random'
 
 export type EligibilityPolicy = 'DEVELOPMENT' | 'PRODUCTION'
@@ -99,36 +99,54 @@ export type PreparedInventoryResult =
   | { readonly ok: false; readonly reason: BatchGenerationFailure; readonly diagnostics: BatchDiagnostics }
 
 interface GeneratedMetadata {
+  readonly batchId: string
+  readonly bankVersion: string
   readonly cycleId: string
   readonly eligibilityPolicy: EligibilityPolicy
   readonly total: number
+  readonly actualQuestionCount: number
+  readonly targetQuestionCount: number
+  readonly caseStudyQuestionCount: number
+  readonly standardQuestionCount: number
+  readonly interactiveQuestionCount: number
+  readonly unsectionedQuestionCount: number
   readonly sourceIds: readonly string[]
   readonly optionOrder: Readonly<Record<string, readonly string[]>>
   readonly interactionKinds: Readonly<Record<string, InteractionKind>>
+  /** Approved canonical scenario provenance independent of a question's reviewed presentation roles. */
+  readonly sourceCaseStudyIds: Readonly<Partial<Record<string, string>>>
 }
+
+export type NormalSection = ExamSection & { readonly kind: NormalExamSectionKind }
 
 export interface GeneratedNormalBatch extends ExamBatch, GeneratedMetadata {
   readonly kind: 'NORMAL_BATCH'
   readonly mode: EligibilityPolicy
+  readonly batchMode: 'NORMAL'
+  readonly sections: readonly NormalSection[]
 }
 
-export interface RemainderSection {
+export type RemainderSection = ExamSection & {
   readonly kind: 'REMAINDER_CASE_STUDY' | 'STANDARD_BLOCK' | 'FINAL_INTERACTIVE_BLOCK' | 'REMAINDER_UNSECTIONED'
-  readonly questionIds: readonly string[]
-  readonly caseStudyId?: string
 }
 
-export interface GeneratedRemainderBatch extends GeneratedMetadata {
-  readonly kind: 'FINAL_REMAINDER_BATCH'
-  readonly id: string
-  readonly contentVersion: string
-  readonly seed: Seed
-  readonly mode: EligibilityPolicy
+interface GeneratedFlexibleBatch extends ExamBatch, GeneratedMetadata {
   readonly sections: readonly RemainderSection[]
+  readonly mode: EligibilityPolicy
   readonly normalFailure: NormalBatchFailure
 }
 
-export type GeneratedBatch = GeneratedNormalBatch | GeneratedRemainderBatch
+export interface GeneratedAdaptiveBatch extends GeneratedFlexibleBatch {
+  readonly kind: 'ADAPTIVE_BATCH'
+  readonly batchMode: 'ADAPTIVE'
+}
+
+export interface GeneratedRemainderBatch extends GeneratedFlexibleBatch {
+  readonly kind: 'FINAL_REMAINDER_BATCH'
+  readonly batchMode: 'FINAL_REMAINDER'
+}
+
+export type GeneratedBatch = GeneratedNormalBatch | GeneratedAdaptiveBatch | GeneratedRemainderBatch
 export type BatchGenerationResult =
   | { readonly ok: true; readonly batch: GeneratedBatch; readonly diagnostics: BatchDiagnostics }
   | { readonly ok: false; readonly reason: BatchGenerationFailure; readonly diagnostics: BatchDiagnostics }
@@ -331,12 +349,12 @@ function rankedInventory(input: BatchGenerationInput, inventory: PreparedBatchIn
   }
 }
 
-function normalSections(ranking: Ranking): readonly ExamSection[] | null {
+function normalSections(ranking: Ranking): readonly NormalSection[] | null {
   const families = ranking.families.filter(({ questionIds }) => questionIds.length >= CASE_COUNT)
   const costBound = ranking.interactiveIds.slice(0, INTERACTIVE_COUNT)
     .reduce((sum, id) => sum + ranking.interactiveCosts.get(id)!, 0)
   let lowest = Infinity
-  let best: readonly ExamSection[] | null = null
+  let best: readonly NormalSection[] | null = null
   for (const [index, first] of families.entries()) {
     for (const second of families.slice(index + 1)) {
       const result = allocateRoles([
@@ -371,29 +389,50 @@ function rawShortages(diagnostics: BatchDiagnostics): NormalBatchFailure[] {
   return constraints
 }
 
-function remainderSections(
+/** The preferred special roles retain their normal limits until genuine standards
+ * run out. Then draw from any remaining eligible role to use the bank completely.
+ * One canonical family instance per batch owns its selected children. */
+function flexibleSections(
   input: BatchGenerationInput,
   inventory: PreparedBatchInventory,
   ranking: Ranking,
 ): readonly RemainderSection[] {
+  const limit = Math.min(NORMAL_QUESTION_COUNT, inventory.eligibleIds.length)
   const placed = new Set<string>()
-  function consume(pool: readonly string[]): readonly string[] {
-    return pool.filter((id) => {
-      if (placed.has(id)) return false
+  const consume = (pool: readonly string[], count = limit): readonly string[] => {
+    const selected: string[] = []
+    for (const id of pool) {
+      if (placed.size >= limit || selected.length >= count) break
+      if (placed.has(id)) continue
       placed.add(id)
-      return true
-    })
+      selected.push(id)
+    }
+    return selected
   }
-  const groups: RemainderSection[] = ranking.families.map(({ id }) => ({
-    kind: 'REMAINDER_CASE_STUDY', caseStudyId: id, questionIds: consume(ranking.children.get(id)!),
-  }))
-  // A reviewed scenario remains intact. When an independent question can fill
-  // both roles, preserve its interactive presentation in the last section.
-  const interactive = consume(ranking.interactiveIds)
-  const standard = consume(ranking.standardIds)
+  const families = [...ranking.families].sort((a, b) =>
+    Math.min(CASE_COUNT, b.questionIds.length) - Math.min(CASE_COUNT, a.questionIds.length))
+  const ownedByCase = new Set(families.flatMap(({ questionIds }) => questionIds))
+  const genuineInteractive = ranking.interactiveIds.filter((id) => !ownedByCase.has(id))
+  const ownedByInteractive = new Set(genuineInteractive)
+  // An approved canonical family or reviewed interactive presentation takes
+  // precedence in a flexible batch even when multiple approved roles exist.
+  const genuineStandard = ranking.standardIds.filter((id) => !ownedByCase.has(id) && !ownedByInteractive.has(id))
+  const selectedByFamily = new Map<string, readonly string[]>()
+  for (const { id } of families.slice(0, 2)) selectedByFamily.set(id, consume(ranking.children.get(id)!, CASE_COUNT))
+  const preferredInteractive = consume(genuineInteractive, INTERACTIVE_COUNT)
+  const standard = consume(genuineStandard)
+  for (const { id } of families) {
+    if (placed.size === limit) break
+    const children = consume(ranking.children.get(id)!)
+    if (children.length > 0) selectedByFamily.set(id, [...(selectedByFamily.get(id) ?? []), ...children])
+  }
+  const interactive = [...preferredInteractive, ...consume(genuineInteractive)]
   const unsectioned = consume(seededQuestionOrder(
-    inventory.eligibleQuestions.map(({ sourceId }) => sourceId), input.seed, input.bank.version, 'batch:remainder',
+    inventory.eligibleIds, input.seed, input.bank.version, 'batch:remainder',
   ))
+  const groups: RemainderSection[] = [...selectedByFamily.entries()].map(([caseStudyId, questionIds]) => ({
+    kind: 'REMAINDER_CASE_STUDY', caseStudyId, questionIds,
+  }))
   return [
     ...groups,
     { kind: 'STANDARD_BLOCK' as const, questionIds: standard },
@@ -402,7 +441,7 @@ function remainderSections(
   ].filter(({ questionIds }) => questionIds.length > 0)
 }
 
-function snapshotSections<T extends ExamSection | RemainderSection>(sections: readonly T[]): readonly T[] {
+function snapshotSections<T extends ExamSection>(sections: readonly T[]): readonly T[] {
   return Object.freeze(sections.map((section) => {
     const copied: T = { ...section, questionIds: Object.freeze([...section.questionIds]) }
     Object.freeze(copied)
@@ -423,7 +462,7 @@ function batchIdentifier(parts: readonly unknown[]): string {
 function generatedFields(
   input: BatchGenerationInput,
   inventory: PreparedBatchInventory,
-  sections: readonly (ExamSection | RemainderSection)[],
+  sections: readonly ExamSection[],
 ): GeneratedMetadata & Pick<ExamBatch, 'id' | 'contentVersion' | 'seed'> & { readonly mode: EligibilityPolicy } {
   const byId = new Map(inventory.eligibleQuestions.map((question) => [question.sourceId, question]))
   const sourceIds = Object.freeze(sections.flatMap(({ questionIds }) => questionIds))
@@ -438,17 +477,32 @@ function generatedFields(
   const id = batchIdentifier([
     input.cycleState.cycleId, input.bank.version, input.eligibilityPolicy, input.seed, sections, optionOrder, interactionKinds,
   ])
+  const covered = new Set(sourceIds)
+  const sourceCaseStudyIds = Object.freeze(Object.fromEntries(inventory.caseFamilies.flatMap(({ id: familyId, questionIds }) =>
+    questionIds.filter((childId) => covered.has(childId)).map((childId) => [childId, familyId]),
+  )))
+  const count = (kind: ExamSection['kind']) => sections.reduce((total, section) =>
+    section.kind === kind ? total + section.questionIds.length : total, 0)
   return {
     id,
+    batchId: id,
     contentVersion: input.bank.version,
+    bankVersion: input.bank.version,
     seed: input.seed,
     mode: input.eligibilityPolicy,
     cycleId: input.cycleState.cycleId,
     eligibilityPolicy: input.eligibilityPolicy,
     total: sourceIds.length,
+    actualQuestionCount: sourceIds.length,
+    targetQuestionCount: NORMAL_QUESTION_COUNT,
+    caseStudyQuestionCount: count('CASE_STUDY_1') + count('CASE_STUDY_2') + count('REMAINDER_CASE_STUDY'),
+    standardQuestionCount: count('STANDARD_BLOCK'),
+    interactiveQuestionCount: count('FINAL_INTERACTIVE_BLOCK'),
+    unsectionedQuestionCount: count('REMAINDER_UNSECTIONED'),
     sourceIds,
     optionOrder,
     interactionKinds,
+    sourceCaseStudyIds,
   }
 }
 
@@ -485,9 +539,9 @@ export function generateExactDevelopmentBatch(
       const pool = index === 2 ? standards : interactions
       return section.caseStudyId !== undefined || !section.questionIds.every(id => pool.has(id))
     })) return fail('INVALID_INPUT', diagnostics)
-  const sections = snapshotSections(exact)
+  const sections = snapshotSections(exact as readonly NormalSection[])
   const batch: GeneratedNormalBatch = Object.freeze({
-    kind: 'NORMAL_BATCH', ...generatedFields(input, inventory, sections), sections,
+    kind: 'NORMAL_BATCH', batchMode: 'NORMAL', ...generatedFields(input, inventory, sections), sections,
   })
   return { ok: true, batch, diagnostics }
 }
@@ -506,6 +560,7 @@ export function generateBatch(input: BatchGenerationInput): BatchGenerationResul
       const sections = snapshotSections(assignment)
       const batch: GeneratedNormalBatch = Object.freeze({
         kind: 'NORMAL_BATCH',
+        batchMode: 'NORMAL',
         ...generatedFields(input, inventory, sections),
         sections,
       })
@@ -514,10 +569,11 @@ export function generateBatch(input: BatchGenerationInput): BatchGenerationResul
   }
   const constraints = Object.freeze(shortages.length > 0 ? shortages : ['CROSS_SECTION_ALLOCATION_UNSATISFIABLE' as const])
   const normalFailure = constraints.length > 1 ? 'MULTIPLE_CONSTRAINTS_EXHAUSTED' : constraints[0]!
-  const sections = snapshotSections(remainderSections(input, inventory, ranked))
-  const batch: GeneratedRemainderBatch = Object.freeze({
-    kind: 'FINAL_REMAINDER_BATCH', ...generatedFields(input, inventory, sections), sections, normalFailure,
-  })
+  const sections = snapshotSections(flexibleSections(input, inventory, ranked))
+  const fields = { ...generatedFields(input, inventory, sections), sections, normalFailure }
+  const batch: GeneratedAdaptiveBatch | GeneratedRemainderBatch = fields.total < NORMAL_QUESTION_COUNT
+    ? Object.freeze({ ...fields, kind: 'FINAL_REMAINDER_BATCH', batchMode: 'FINAL_REMAINDER' })
+    : Object.freeze({ ...fields, kind: 'ADAPTIVE_BATCH', batchMode: 'ADAPTIVE' })
   return {
     ok: true,
     batch,

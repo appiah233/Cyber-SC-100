@@ -1,7 +1,7 @@
 // Synthetic controls only. This is not a question bank, substitute reference fixture, or score key.
 import { NORMAL_SECTIONS } from '../domain'
 import { generateBatch } from '../domain/batch-engine'
-import type { ExamCycle, ExamSectionKind } from '../domain'
+import type { ExamCycle, NormalExamSectionKind } from '../domain'
 import type { BatchBank, BatchQuestion, GeneratedNormalBatch } from '../domain/batch-engine'
 import type { FoundationPreview, FoundationQuestion } from '../app/App'
 
@@ -9,7 +9,7 @@ export const PREVIEW_VERSION = 'synthetic-preview-v3'
 export const ATTEMPT_ID = 'synthetic-foundation-attempt'
 export const CYCLE_ID = 'synthetic-foundation-cycle'
 
-export const sectionTitles: Readonly<Record<ExamSectionKind, string>> = {
+export const sectionTitles: Readonly<Record<NormalExamSectionKind, string>> = {
   CASE_STUDY_1: 'Case Study 1',
   CASE_STUDY_2: 'Case Study 2',
   STANDARD_BLOCK: 'Standard Questions',

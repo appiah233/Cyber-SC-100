@@ -31,6 +31,7 @@ export interface FoundationQuestion {
 
 export interface FoundationSection {
   readonly id: string
+  readonly kind?: string
   readonly label: string
   readonly count: number
   readonly state: 'locked' | 'current' | 'upcoming'
@@ -39,6 +40,7 @@ export interface FoundationSection {
 export interface FoundationPreview {
   readonly sections: readonly FoundationSection[]
   readonly activeSectionId: string
+  readonly batchMode?: 'NORMAL' | 'ADAPTIVE' | 'FINAL_REMAINDER'
   readonly questions: readonly FoundationQuestion[]
   readonly position: number
   readonly answers?: Readonly<Record<string, DisplayResponse>>
@@ -168,6 +170,28 @@ const wideWorkspace = '(min-width: 61rem)'
 const wideCasePane = '(width > 71rem)'
 const matchesWidth = (query: string) => typeof matchMedia === 'function' && matchMedia(query).matches
 
+const countLabel = (count: number, noun: 'question' | 'section') =>
+  `${count} ${noun}${count === 1 ? '' : 's'}`
+
+function sectionKind(section: FoundationSection | undefined) {
+  return section?.kind ?? section?.id.split(':')[0]
+}
+
+function caseSection(section: FoundationSection | undefined) {
+  const kind = sectionKind(section)
+  return kind === 'CASE_STUDY_1' || kind === 'CASE_STUDY_2' || kind === 'REMAINDER_CASE_STUDY'
+}
+
+function sectionLabels(sections: readonly FoundationSection[]) {
+  const caseCount = sections.filter(caseSection).length
+  let caseNumber = 0
+  return new Map(sections.map((section) => {
+    if (!caseSection(section)) return [section.id, section.label]
+    caseNumber += 1
+    return [section.id, caseCount === 1 ? 'Case Study' : `Case Study ${caseNumber}`]
+  }))
+}
+
 export default function App({ preview, onAction }: {
   preview?: FoundationPreview
   onAction?: (action: FoundationAction) => void
@@ -185,10 +209,14 @@ export default function App({ preview, onAction }: {
   const data = preview ?? sample
   const activeIndex = data.sections.findIndex((section) => section.id === data.activeSectionId)
   const active = data.sections[activeIndex]
+  const labels = sectionLabels(data.sections)
+  const activeLabel = active && labels.get(active.id)
+  const total = data.sections.reduce((count, section) => count + section.count, 0)
   const question = data.questions[data.position]
   const requestedView = data.view ?? (data.error ? 'error' : 'question')
-  const view = ((requestedView === 'question' && !question) ||
-      ((requestedView === 'question' || requestedView === 'review') && (!active || active.state !== 'current')))
+  const view = ((requestedView === 'intro' && total <= 0) || (requestedView === 'question' && !question) ||
+      ((requestedView === 'question' || requestedView === 'review') &&
+        (!active || active.state !== 'current' || active.count <= 0 || active.count !== data.questions.length)))
     ? 'error' : requestedView
   const isWorking = view === 'question' || view === 'review'
   const markSet = new Set(data.marks ?? [])
@@ -197,7 +225,6 @@ export default function App({ preview, onAction }: {
   })) : []
   const answeredCount = questionStates.filter(({ state }) => state === 'Answered').length
   const markedCount = questionStates.filter(({ marked }) => marked).length
-  const total = data.sections.reduce((count, section) => count + section.count, 0)
   const sectionCount = active?.count ?? data.questions.length
   const unansweredCount = Math.max(0, sectionCount - answeredCount)
   const overallPosition = Math.min(total, data.sections.slice(0, Math.max(0, activeIndex)).reduce((count, section) => count + section.count, 0)
@@ -205,11 +232,13 @@ export default function App({ preview, onAction }: {
   const status = data.status ?? { label: 'Not saved' }
   const actionsDisabled = data.readOnly === true || Boolean(preview && !onAction)
   const canCommit = Boolean(preview && onAction && !actionsDisabled && !data.hasUnsavedChange)
-  const isCase = data.activeSectionId.startsWith('CASE_STUDY') || Boolean(data.context)
-  const isInteractive = data.activeSectionId === 'FINAL_INTERACTIVE_BLOCK'
+  const isCase = caseSection(active)
+  const isInteractive = sectionKind(active) === 'FINAL_INTERACTIVE_BLOCK'
   const finishLabel = isCase ? 'Finish case study' : isInteractive ? 'Finish interactive section' : 'Finish section'
   const unnamedTitle = data.synthetic === true ? 'Practice examination' : 'Examination'
   const title = data.examTitle ?? unnamedTitle
+  const finalBatchLabel = data.batchMode === 'FINAL_REMAINDER' ? 'Final Examination Batch' : null
+  const oneSection = data.sections.length === 1
   const currentMarked = Boolean(question && markSet.has(question.id))
   const filterQuestions = (currentFilter: ReviewFilter) => questionStates.filter(({ state, marked }) =>
     currentFilter === 'all' || (currentFilter === 'marked' ? marked : state !== 'Answered'))
@@ -280,8 +309,8 @@ export default function App({ preview, onAction }: {
         <li key={section.id} className={`step step--${section.state}`} aria-current={section.state === 'current' && isWorking ? 'step' : undefined}>
           <span className="step-number" aria-hidden="true">{section.state === 'locked' && view !== 'intro' ? '✓' : String(index + 1).padStart(2, '0')}</span>
           <span className="step-copy">
-            <strong>{section.label}</strong>
-            <span>{view === 'intro' ? '' : section.state === 'locked' ? 'Locked · ' : section.state === 'current' ? 'Current · ' : 'Upcoming · '}{section.count} {section.count === 1 ? 'question' : 'questions'}</span>
+            <strong>{labels.get(section.id)}</strong>
+            <span>{view === 'intro' ? '' : section.state === 'locked' ? 'Locked · ' : section.state === 'current' ? 'Current · ' : 'Upcoming · '}{countLabel(section.count, 'question')}</span>
           </span>
         </li>
       ))}
@@ -310,7 +339,7 @@ export default function App({ preview, onAction }: {
             <div className="exam-strip-inner">
               <div className="exam-location">
                 <span className="eyebrow">Section {activeIndex + 1} of {data.sections.length}</span>
-                <strong>{active.label}</strong>
+                <strong>{activeLabel}</strong>
               </div>
               <div className="exam-progress">
                 <span><strong>{view === 'review' ? 'Review' : `Question ${data.position + 1} of ${sectionCount}`}</strong><span>{answeredCount} of {sectionCount} answered</span></span>
@@ -341,19 +370,21 @@ export default function App({ preview, onAction }: {
         {view === 'intro' && (
           <Panel className="surface intro" label="Examination introduction">
             <div className="intro-main">
-              <p className="eyebrow">Before you begin</p>
-              <h1 ref={headingRef} tabIndex={-1}>{title}</h1>
-              <p className="intro-lead">Work through the sections in order. You can change and review your responses within the active section.</p>
+              <p className="eyebrow">{finalBatchLabel ? title : 'Before you begin'}</p>
+              <h1 ref={headingRef} tabIndex={-1}>{finalBatchLabel ?? title}</h1>
+              <p className="intro-lead">{oneSection
+                ? 'You can change and review your responses before submitting this section.'
+                : 'Work through the sections in order. You can change and review your responses within the active section.'}</p>
             </div>
             <div className="intro-outline">
               <h2>Exam structure</h2>
-              <p>{total} questions · {data.sections.length} sections</p>
+              <p>{countLabel(total, 'question')} · {countLabel(data.sections.length, 'section')}</p>
               {sections}
             </div>
             <div className="intro-actions">
               <div className="commit-note">
-                <strong>Sections cannot be reopened</strong>
-                <p>Once you submit a section, you cannot return to its questions or change its responses.</p>
+                <strong>{oneSection ? 'This section cannot be reopened' : 'Sections cannot be reopened'}</strong>
+                <p>Once you submit {oneSection ? 'this section' : 'a section'}, you cannot return to {sectionCount === 1 && oneSection ? 'its question or change your response' : 'its questions or change your responses'}.</p>
               </div>
               <Button tone="primary" disabled={actionsDisabled} onClick={() => act({ type: 'START' })}>Start exam <span aria-hidden="true">→</span></Button>
               <p className="content-notice">{data.contentNotice ?? (data.synthetic === false
@@ -455,9 +486,9 @@ export default function App({ preview, onAction }: {
 
         {view === 'review' && (
           <Panel className="surface review" label="Active section review">
-            <p className="eyebrow">{active?.label}</p>
+            <p className="eyebrow">{activeLabel}</p>
             <h1 ref={headingRef} tabIndex={-1}>Review section</h1>
-            <p>Return to any question in this section before submitting. Incomplete responses count as unanswered.</p>
+            <p>{sectionCount === 1 ? 'You can return to the question before submitting.' : 'Return to any question in this section before submitting.'} Incomplete responses count as unanswered.</p>
             <dl className="review-stats">
               {([['Total questions', sectionCount], ['Answered', answeredCount], ['Unanswered', unansweredCount], ['Marked for review', markedCount]] as const)
                 .map(([name, value]) => <div key={name}><dt>{name}</dt><dd>{value}</dd></div>)}
@@ -474,7 +505,7 @@ export default function App({ preview, onAction }: {
                 <Button key={value} tone="quiet" aria-pressed={filter === value} onClick={() => setFilter(value)}>{label}</Button>
               ))}
             </div>
-            <p className="review-result-count" role="status">Showing {filterQuestions(filter).length} of {sectionCount} questions</p>
+            <p className="review-result-count" role="status">Showing {filterQuestions(filter).length} of {countLabel(sectionCount, 'question')}</p>
             {filterQuestions(filter).length ? <ul className="review-list" role="list">
               {filterQuestions(filter).map(({ item, position, state, marked }) => (
                 <li key={item.id}>
@@ -488,9 +519,9 @@ export default function App({ preview, onAction }: {
 
         {view === 'final' && (
           <Panel className="surface review final-panel" label="Final submission">
-            <p className="eyebrow">All sections finished</p>
+            <p className="eyebrow">{finalBatchLabel ?? (oneSection ? 'Section finished' : 'All sections finished')}</p>
             <h1 ref={headingRef} tabIndex={-1}>Final submission</h1>
-            <p>You have completed all examination sections. Submitted sections cannot be reopened.</p>
+            <p>{oneSection ? 'You have completed this examination section. It cannot be reopened.' : 'You have completed all examination sections. Submitted sections cannot be reopened.'}</p>
             {sections}
             <Button tone="primary" disabled={!canCommit} onClick={(event) => {
               dialogTrigger.current = event.currentTarget
@@ -517,7 +548,7 @@ export default function App({ preview, onAction }: {
         )}
 
         {isWorking && <details className="section-outline">
-          <summary>Exam sections and locks</summary>
+          <summary>{oneSection ? 'Exam section and lock' : 'Exam sections and locks'}</summary>
           {sections}
         </details>}
         <footer className="page-footer">Examination Hub <span aria-hidden="true">·</span> Candidate examination</footer>
@@ -527,7 +558,7 @@ export default function App({ preview, onAction }: {
         title={dialog === 'final' ? 'Submit this exam?' : isCase ? 'Finish this case study?' : isInteractive ? 'Finish this interactive section?' : 'Finish this section?'}
         description={dialog === 'final'
           ? 'After you submit the exam, you cannot edit your responses.'
-          : `${unansweredCount > 0 ? `You have ${unansweredCount} unanswered or incomplete ${unansweredCount === 1 ? 'question' : 'questions'}. ` : ''}After you submit this ${isCase ? 'case study' : 'section'}, you cannot return to these questions or change your answers.`}
+          : `${unansweredCount > 0 ? `You have ${unansweredCount} unanswered or incomplete ${unansweredCount === 1 ? 'question' : 'questions'}. ` : ''}After you submit this ${isCase ? 'case study' : 'section'}, you cannot return to ${sectionCount === 1 ? 'this question or change your answer' : 'these questions or change your answers'}.`}
         confirmLabel={dialog === 'final' ? 'Submit exam' : isCase ? 'Submit case study' : 'Submit section'}
         cancelLabel={dialog === 'final' || isCase ? 'Go back' : 'Return to review'}
         onCancel={dismiss}

@@ -21,7 +21,12 @@ function normal(id: string, namespace: string): GeneratedNormalBatch {
   }))
   const sourceIds = sections.flatMap(({ questionIds }) => questionIds)
   return {
-    id, kind: 'NORMAL_BATCH', cycleId: 'cycle', contentVersion: 'bank-v1',
+    id, batchId: id, kind: 'NORMAL_BATCH', batchMode: 'NORMAL', cycleId: 'cycle',
+    contentVersion: 'bank-v1', bankVersion: 'bank-v1',
+    actualQuestionCount: 59, targetQuestionCount: 59, caseStudyQuestionCount: 6,
+    standardQuestionCount: 49, interactiveQuestionCount: 4, unsectionedQuestionCount: 0,
+    sourceCaseStudyIds: Object.fromEntries(sections.slice(0, 2).flatMap(({ caseStudyId, questionIds }) =>
+      questionIds.map(key => [key, caseStudyId!]))),
     seed: 'synthetic-test', eligibilityPolicy: 'DEVELOPMENT', mode: 'DEVELOPMENT',
     sections, sourceIds, total: 59, optionOrder: { [sourceIds[0]]: ['opt-2', 'opt-1'] },
     interactionKinds: Object.fromEntries(sourceIds.map((question, position) => [
@@ -32,7 +37,11 @@ function normal(id: string, namespace: string): GeneratedNormalBatch {
 
 function remainder(id: string): GeneratedRemainderBatch {
   return {
-    id, kind: 'FINAL_REMAINDER_BATCH', cycleId: 'cycle', contentVersion: 'bank-v1',
+    id, batchId: id, kind: 'FINAL_REMAINDER_BATCH', batchMode: 'FINAL_REMAINDER', cycleId: 'cycle',
+    contentVersion: 'bank-v1', bankVersion: 'bank-v1',
+    actualQuestionCount: 3, targetQuestionCount: 59, caseStudyQuestionCount: 1,
+    standardQuestionCount: 0, interactiveQuestionCount: 1, unsectionedQuestionCount: 1,
+    sourceCaseStudyIds: { 'r-case': 'remaining-family' },
     seed: 'synthetic-test', eligibilityPolicy: 'DEVELOPMENT', mode: 'DEVELOPMENT',
     sections: [
       { kind: 'REMAINDER_CASE_STUDY', caseStudyId: 'remaining-family', questionIds: ['r-case'] },
@@ -76,10 +85,12 @@ describe('cycle and batch lifecycle', () => {
     expect(isCycleLifecycle(JSON.parse(JSON.stringify(state)))).toBe(true)
   })
 
-  it('allows overlapping previews, reserves only on START, and rejects replay after consumption', () => {
+  it('rejects overlapping live previews, reserves only on START, and rejects replay after consumption', () => {
     const batch = normal('batch-a', 'same')
     let state = generate(initialize(), batch, 101)
-    state = generate(state, normal('batch-b', 'same'), 102)
+    expect(transitionCycleLifecycle(state, { type: 'GENERATE', batch: normal('duplicate', 'same'), at: 102 }))
+      .toEqual({ ok: false, reason: 'ACTIVE_BATCH_EXISTS' })
+    state = generate(state, normal('batch-b', 'different'), 102)
     state = step(state, { type: 'START', batchId: batch.id, at: 103 })
     expect(activeExamCycle(state).reservedSourceIds).toEqual(batch.sourceIds)
     expect(activeExamCycle(state).consumedSourceIds).toEqual([])
@@ -88,9 +99,21 @@ describe('cycle and batch lifecycle', () => {
     state = step(state, { type: 'COMPLETE', batchId: batch.id, at: 105 })
     expect(activeExamCycle(state).reservedSourceIds).toEqual([])
     expect(activeExamCycle(state).consumedSourceIds).toEqual(batch.sourceIds)
-    expect(transitionCycleLifecycle(state, { type: 'START', batchId: 'batch-b', at: 106 }))
-      .toEqual({ ok: false, reason: 'QUESTION_ALREADY_USED' })
+    // A disjoint preview can run only after the first one commits.
+    expect(transitionCycleLifecycle(state, { type: 'START', batchId: 'batch-b', at: 106 }).ok).toBe(true)
     expect(transitionCycleLifecycle(state, { type: 'GENERATE', batch: normal('batch-c', 'same'), at: 106 }))
+      .toEqual({ ok: false, reason: 'QUESTION_ALREADY_USED' })
+  })
+
+  it('restores old overlapping Phase 4 drafts without allowing either to replay consumed questions', () => {
+    let state = generate(initialize(), normal('first', 'legacy'), 101)
+    state = generate(state, normal('second', 'unrelated'), 102)
+    const clone = JSON.parse(JSON.stringify(state))
+    clone.cycles[0].batches[1].batch = normal('second', 'legacy')
+    expect(isCycleLifecycle(clone)).toBe(true)
+    state = step(clone, { type: 'START', batchId: 'first', at: 103 })
+    state = step(state, { type: 'COMPLETE', batchId: 'first', at: 104 })
+    expect(transitionCycleLifecycle(state, { type: 'START', batchId: 'second', at: 105 }))
       .toEqual({ ok: false, reason: 'QUESTION_ALREADY_USED' })
   })
 
@@ -119,16 +142,20 @@ describe('cycle and batch lifecycle', () => {
     expect(activeExamCycle(state).batches).toHaveLength(2)
   })
 
-  it('closes on a retired final remainder, preserves history and permits IDs in a new explicit cycle', () => {
+  it('requires verified exhaustion after a final remainder, preserves history and permits IDs in a new explicit cycle', () => {
     const batch = remainder('remainder')
     let state = generate(initialize(), batch, 101)
     state = step(state, { type: 'START', batchId: batch.id, at: 102 })
-    expect(transitionCycleLifecycle(state, { type: 'GENERATE', batch: normal('late', 'late'), at: 103 }))
+    expect(transitionCycleLifecycle(state, { type: 'COMPLETE_CYCLE', unusedEligibleSourceIds: [], at: 102 }))
       .toEqual({ ok: false, reason: 'ACTIVE_BATCH_EXISTS' })
     state = step(state, { type: 'ABANDON', batchId: batch.id, at: 103 })
+    expect(activeExamCycle(state).status).toBe('ACTIVE')
+    expect(transitionCycleLifecycle(state, { type: 'COMPLETE_CYCLE', unusedEligibleSourceIds: ['remaining'], at: 103 }))
+      .toEqual({ ok: false, reason: 'ELIGIBLE_CONTENT_REMAINS' })
+    state = step(state, { type: 'COMPLETE_CYCLE', unusedEligibleSourceIds: [], at: 104 })
     const prior = activeExamCycle(state)
     expect(prior.status).toBe('COMPLETE')
-    expect(prior.completionReason).toBe('FINAL_REMAINDER_RETIRED')
+    expect(prior.completionReason).toBe('NO_ELIGIBLE_UNUSED_CONTENT')
     expect(prior.consumedSourceIds).toEqual(batch.sourceIds)
     expect(transitionCycleLifecycle(state, { type: 'START', batchId: batch.id, at: 104 }))
       .toEqual({ ok: false, reason: 'CYCLE_COMPLETE' })
@@ -136,10 +163,49 @@ describe('cycle and batch lifecycle', () => {
       eligibilityPolicy: 'DEVELOPMENT', at: 104 })
     expect(state.cycles[0]).toEqual(prior)
     expect(activeExamCycle(state)).toMatchObject({ id: 'cycle-next', bankVersion: 'bank-v2', consumedSourceIds: [] })
-    const next = { ...batch, cycleId: 'cycle-next', contentVersion: 'bank-v2', id: 'remainder-next' }
+    const next = { ...batch, cycleId: 'cycle-next', contentVersion: 'bank-v2', bankVersion: 'bank-v2', id: 'remainder-next', batchId: 'remainder-next' }
     state = generate(state, next, 105)
     state = step(state, { type: 'START', batchId: next.id, at: 106 })
     expect(activeExamCycle(state).reservedSourceIds).toEqual(prior.consumedSourceIds)
+  })
+
+  it('preserves a Phase 4 oversized remainder without starting any queued oversized legacy draft', () => {
+    const plan = remainder('older-plan')
+    let state = generate(initialize(), plan, 101)
+    state = step(state, { type: 'START', batchId: plan.id, at: 102 })
+    state = step(state, { type: 'COMPLETE', batchId: plan.id, at: 103 })
+    state = step(state, { type: 'COMPLETE_CYCLE', unusedEligibleSourceIds: [], at: 103 })
+    const clone = JSON.parse(JSON.stringify(state))
+    const oldCycle = clone.cycles[0]
+    const archived = oldCycle.batches[0].batch
+    for (const key of ['batchId', 'bankVersion', 'batchMode', 'actualQuestionCount', 'targetQuestionCount',
+      'caseStudyQuestionCount', 'standardQuestionCount', 'interactiveQuestionCount', 'unsectionedQuestionCount', 'sourceCaseStudyIds']) {
+      delete archived[key]
+    }
+    const extra = Array.from({ length: 60 }, (_, index) => 'older-bank-' + index)
+    archived.sections.splice(1, 0, { kind: 'STANDARD_BLOCK', questionIds: extra })
+    archived.sourceIds.splice(1, 0, ...extra)
+    archived.total = archived.sourceIds.length
+    for (const key of extra) archived.interactionKinds[key] = 'SINGLE_CHOICE'
+    oldCycle.consumedSourceIds = [...archived.sourceIds]
+    oldCycle.completionReason = 'FINAL_REMAINDER_RETIRED'
+
+    expect(isCycleLifecycle(clone)).toBe(true)
+    expect(restoreCycleLifecycle(clone).cycles[0].consumedSourceIds).toEqual(archived.sourceIds)
+    expect(archived.sourceIds).toHaveLength(63)
+    expect(transitionCycleLifecycle(initialize(), { type: 'GENERATE', batch: archived, at: 101 }))
+      .toEqual({ ok: false, reason: 'INVALID_BATCH' })
+
+    const queued = structuredClone(clone)
+    Object.assign(queued.cycles[0], { status: 'ACTIVE', closedAt: null, completionReason: null, consumedSourceIds: [] })
+    Object.assign(queued.cycles[0].batches[0], { status: 'GENERATED', startedAt: null, endedAt: null })
+    expect(isCycleLifecycle(queued)).toBe(true)
+    expect(transitionCycleLifecycle(queued, { type: 'START', batchId: plan.id, at: 104 }))
+      .toEqual({ ok: false, reason: 'INVALID_BATCH' })
+    const cleared = step(queued, { type: 'INVALIDATE', batchId: plan.id, at: 104 })
+    expect(activeExamCycle(cleared).consumedSourceIds).toEqual([])
+    expect(activeExamCycle(cleared).reservedSourceIds).toEqual([])
+    expect(generate(cleared, remainder('safe-new-plan'), 105).cycles[0].batches).toHaveLength(2)
   })
 
   it('requires exhausted inventory and no running or still-available preview before explicit closure', () => {
@@ -163,7 +229,7 @@ describe('cycle and batch lifecycle', () => {
   it('rejects mismatched content and policy, malformed options and duplicate IDs', () => {
     const state = initialize()
     const batch = normal('batch-a', 'known')
-    expect(transitionCycleLifecycle(state, { type: 'GENERATE', batch: { ...batch, contentVersion: 'bank-v2' }, at: 101 }))
+    expect(transitionCycleLifecycle(state, { type: 'GENERATE', batch: { ...batch, contentVersion: 'bank-v2', bankVersion: 'bank-v2' }, at: 101 }))
       .toEqual({ ok: false, reason: 'BANK_VERSION_MISMATCH' })
     expect(transitionCycleLifecycle(state, { type: 'GENERATE', batch: {
       ...batch, mode: 'PRODUCTION', eligibilityPolicy: 'PRODUCTION',

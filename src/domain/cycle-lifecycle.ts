@@ -1,5 +1,6 @@
-import { validateNormalBatch } from './attempt'
+import { validateExamBatch, validateNormalBatch } from './attempt'
 import type { EligibilityPolicy, GeneratedBatch } from './batch-engine'
+import { NORMAL_QUESTION_COUNT } from './model'
 import type { SourceQuestionId } from './model'
 
 export type BatchStatus = 'GENERATED' | 'STARTED' | 'COMPLETED' | 'ABANDONED' | 'INVALIDATED'
@@ -134,7 +135,13 @@ const normalFailures = new Set([
   'MULTIPLE_CONSTRAINTS_EXHAUSTED', 'CROSS_SECTION_ALLOCATION_UNSATISFIABLE',
 ])
 
-function validBatch(value: unknown): value is GeneratedBatch {
+const additiveMetadata = [
+  'batchId', 'bankVersion', 'batchMode', 'actualQuestionCount', 'targetQuestionCount',
+  'caseStudyQuestionCount', 'standardQuestionCount', 'interactiveQuestionCount', 'unsectionedQuestionCount',
+  'sourceCaseStudyIds',
+] as const
+
+function validBatch(value: unknown, allowLegacy = false): value is GeneratedBatch {
   if (!record(value) || !plainJson(value) || !id(value.id) || !id(value.cycleId)
     || !id(value.contentVersion) || !policy(value.eligibilityPolicy) || value.mode !== value.eligibilityPolicy
     || !idList(value.sourceIds)
@@ -156,9 +163,33 @@ function validBatch(value: unknown): value is GeneratedBatch {
   if (flattened.length !== value.sourceIds.length
     || flattened.some((question, index) => question !== (value.sourceIds as readonly string[])[index])) return false
 
-  if (value.kind === 'NORMAL_BATCH') return validateNormalBatch(value as unknown as GeneratedBatch & {
-    readonly kind: 'NORMAL_BATCH'
-  }).ok
+  if (additiveMetadata.some((key) => Object.hasOwn(value, key))) {
+    const modeForKind: Readonly<Record<string, string>> = {
+      NORMAL_BATCH: 'NORMAL', ADAPTIVE_BATCH: 'ADAPTIVE', FINAL_REMAINDER_BATCH: 'FINAL_REMAINDER',
+    }
+    if (typeof value.kind !== 'string' || !Object.hasOwn(modeForKind, value.kind)
+      || value.batchMode !== modeForKind[value.kind] || value.batchId !== value.id
+      || value.bankVersion !== value.contentVersion || value.actualQuestionCount !== value.total
+      || value.targetQuestionCount !== NORMAL_QUESTION_COUNT || !record(value.sourceCaseStudyIds)
+      || !Object.entries(value.sourceCaseStudyIds).every(([key, family]) => source.has(key) && id(family))
+      || !validateExamBatch(value as unknown as GeneratedBatch).ok) return false
+    if (value.kind !== 'NORMAL_BATCH'
+      && (typeof value.normalFailure !== 'string' || !normalFailures.has(value.normalFailure))) return false
+    const count = (kind: string) => (value as unknown as GeneratedBatch).sections.reduce((n, section) =>
+      n + (section.kind === kind ? section.questionIds.length : 0), 0)
+    if (value.caseStudyQuestionCount !== count('CASE_STUDY_1') + count('CASE_STUDY_2') + count('REMAINDER_CASE_STUDY')
+      || value.standardQuestionCount !== count('STANDARD_BLOCK')
+      || value.interactiveQuestionCount !== count('FINAL_INTERACTIVE_BLOCK')
+      || value.unsectionedQuestionCount !== count('REMAINDER_UNSECTIONED')) return false
+    const provenance = value.sourceCaseStudyIds
+    return (value as unknown as GeneratedBatch).sections.every((section) => !section.caseStudyId
+      || section.questionIds.every((key) => Object.hasOwn(provenance, key) && provenance[key] === section.caseStudyId))
+  }
+
+  // Persisted Phase 4/5 history can predate count/provenance fields. Do not
+  // accept new candidates that omit them or infer new eligibility from them.
+  if (!allowLegacy) return false
+  if (value.kind === 'NORMAL_BATCH') return validateNormalBatch(value as unknown as GeneratedBatch).ok
   if (value.kind !== 'FINAL_REMAINDER_BATCH' || typeof value.normalFailure !== 'string'
     || !normalFailures.has(value.normalFailure)) return false
 
@@ -185,7 +216,7 @@ function validBatch(value: unknown): value is GeneratedBatch {
 }
 
 function readTrackedBatch(value: unknown, cycle: Record<string, unknown>): value is TrackedBatch {
-  if (!record(value) || !validBatch(value.batch) || value.batch.cycleId !== cycle.id
+  if (!record(value) || !validBatch(value.batch, true) || value.batch.cycleId !== cycle.id
     || value.batch.contentVersion !== cycle.bankVersion || value.batch.eligibilityPolicy !== cycle.eligibilityPolicy
     || !timestamp(value.generatedAt)
     || !timestamp(cycle.createdAt) || value.generatedAt < cycle.createdAt) return false
@@ -244,7 +275,8 @@ export function isCycleLifecycle(value: unknown): value is CycleLifecycle {
         started++
         for (const key of tracked.batch.sourceIds) reserved.add(key)
       } else if (tracked.startedAt !== null) {
-        if (tracked.batch.kind === 'FINAL_REMAINDER_BATCH') {
+        if (cycle.completionReason === 'FINAL_REMAINDER_RETIRED'
+          && tracked.batch.kind === 'FINAL_REMAINDER_BATCH' && tracked.batch.batchMode === undefined) {
           if (tracked.endedAt !== cycle.closedAt) return false
           retiredRemainder++
         }
@@ -364,15 +396,17 @@ export function transitionCycleLifecycle(state: CycleLifecycle, command: CycleLi
   if (cycle.status === 'COMPLETE') return fail('CYCLE_COMPLETE')
   const used = new Set([...cycle.consumedSourceIds, ...cycle.reservedSourceIds])
   if (command.type === 'GENERATE') {
-    if (cycle.batches.some((tracked) => tracked.status === 'STARTED'
-      && tracked.batch.kind === 'FINAL_REMAINDER_BATCH')) return fail('ACTIVE_BATCH_EXISTS')
     const candidate = command.batch
     if (!validBatch(candidate) || candidate.cycleId !== cycle.id) return fail('INVALID_BATCH')
     if (candidate.contentVersion !== cycle.bankVersion) return fail('BANK_VERSION_MISMATCH')
     if (candidate.eligibilityPolicy !== cycle.eligibilityPolicy) return fail('ELIGIBILITY_POLICY_MISMATCH')
     if (cycle.batches.some((tracked) => tracked.batch.id === candidate.id)) return fail('BATCH_ALREADY_EXISTS')
     if (candidate.sourceIds.some((key) => used.has(key))) return fail('QUESTION_ALREADY_USED')
+    const draftIds = new Set(cycle.batches.filter(({ status }) => status === 'GENERATED')
+      .flatMap(({ batch }) => batch.sourceIds))
+    if (candidate.sourceIds.some((key) => draftIds.has(key))) return fail('ACTIVE_BATCH_EXISTS')
     // A generated preview snapshots exact membership; it neither reserves nor consumes.
+    // A second simultaneous draft must have disjoint membership.
     const tracked: TrackedBatch = {
       batch: structuredClone(candidate),
       status: 'GENERATED',
@@ -400,6 +434,11 @@ export function transitionCycleLifecycle(state: CycleLifecycle, command: CycleLi
   const replace = (next: TrackedBatch) => cycle.batches.map((item, position) => position === index ? next : item)
   if (command.type === 'START') {
     if (tracked.status !== 'GENERATED') return fail('INVALID_BATCH_TRANSITION')
+    if (tracked.batch.kind === 'FINAL_REMAINDER_BATCH' && tracked.batch.batchMode === undefined) {
+      // Pre-remediation drafts could be larger than the new limit or use
+      // outdated presentation rules; preserve history, regenerate before use.
+      return fail('INVALID_BATCH')
+    }
     if (cycle.batches.some((item) => item.status === 'STARTED')) return fail('ACTIVE_BATCH_EXISTS')
     if (tracked.batch.sourceIds.some((key) => used.has(key))) return fail('QUESTION_ALREADY_USED')
     const batches = replace({ ...tracked, status: 'STARTED', startedAt: command.at })
@@ -422,9 +461,7 @@ export function transitionCycleLifecycle(state: CycleLifecycle, command: CycleLi
     reservedSourceIds: [],
     consumedSourceIds: [...cycle.consumedSourceIds, ...tracked.batch.sourceIds],
   }
-  return update(
-    state,
-    tracked.batch.kind === 'FINAL_REMAINDER_BATCH' ? close(next, command.at, 'FINAL_REMAINDER_RETIRED') : next,
-    command.at,
-  )
+  // A final label describes the planner's selected shape, not a closing
+  // credential. A fresh bank inventory check must prove exhaustion.
+  return update(state, next, command.at)
 }

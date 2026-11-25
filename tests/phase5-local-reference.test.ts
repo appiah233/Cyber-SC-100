@@ -32,6 +32,14 @@ describe.skipIf(!bankDirectory || Boolean(process.env.CI || process.env.GITHUB_A
     const projected = prepareCandidateReference(bank, display, reference, version)
     const ids = projected.batch.sourceIds
     expect(ids.length).toBe(59)
+    expect(projected.batch).toMatchObject({
+      batchMode: 'NORMAL',
+      actualQuestionCount: 59,
+      targetQuestionCount: 59,
+      caseStudyQuestionCount: 6,
+      standardQuestionCount: 49,
+      interactiveQuestionCount: 4,
+    })
     expect(new Set(ids).size).toBe(59)
     expect(projected.batch.sections.map(section => section.questionIds.length)).toEqual([3, 3, 49, 4])
     expect(projected.batch.sections.every((section, i) => section.questionIds.every((id, j) => id === 'Q' + reference.sections[i].sourceIds[j]))).toBe(true)

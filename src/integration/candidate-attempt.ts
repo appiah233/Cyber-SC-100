@@ -1,20 +1,22 @@
 import type { FoundationAction, FoundationPreview, FoundationQuestion } from '../app/App'
-import { createAttempt, isAttemptSnapshot, transitionAttempt } from '../domain'
+import { atSubmittedSectionBoundary, createAttempt, examSectionKey, isAttemptSnapshot, nextExistingSection, transitionAttempt } from '../domain'
 import type { AttemptEvent, ExamAttempt } from '../domain'
-import type { GeneratedNormalBatch } from '../domain/batch-engine'
+import type { GeneratedBatch } from '../domain/batch-engine'
 import { activeExamCycle, createCycleLifecycle, isCycleLifecycle, transitionCycleLifecycle } from '../domain/cycle-lifecycle'
 import type { CycleLifecycle } from '../domain/cycle-lifecycle'
 import { isCandidateAnswerFor, toCandidateAnswer } from '../features/exam/question-response'
 
 export interface FoundationSource {
   readonly attemptId: string
-  readonly batch: GeneratedNormalBatch
+  readonly batch: GeneratedBatch
   readonly question: (id: string, optionOrder: readonly string[] | undefined) => FoundationQuestion
   readonly context?: (caseStudyId: string) => FoundationPreview['context']
   readonly idbName?: string
   readonly examTitle?: string
   readonly synthetic?: boolean
   readonly contentNotice?: string
+  /** Optional complete eligibility universe from a separately verified inventory. */
+  readonly eligibleSourceIds?: readonly string[]
 }
 
 export interface CandidateSnapshot extends ExamAttempt {
@@ -41,7 +43,22 @@ const same = (a: unknown, b: unknown): boolean => {
 }
 
 export function candidateSection(attempt: ExamAttempt) {
-  return attempt.batch.sections.find(({ kind }) => kind === attempt.activeSection)
+  return attempt.batch.sections.find((section) => examSectionKey(section) === attempt.activeSection)
+}
+
+// Phase 5 persisted normal generated plans before the additive metadata.
+// Match their exact shape; never let metadata-bit stripping bypass adaptive
+// plan validation or a source membership/order difference.
+function samePinnedPlan(saved: GeneratedBatch, expected: GeneratedBatch): boolean {
+  if (same(saved, expected)) return true
+  if (saved.kind !== 'NORMAL_BATCH' || saved.batchMode !== undefined || expected.kind !== 'NORMAL_BATCH') return false
+  const {
+    batchId: _id, bankVersion: _version, batchMode: _mode, actualQuestionCount: _actual,
+    targetQuestionCount: _target, caseStudyQuestionCount: _case, standardQuestionCount: _standard,
+    interactiveQuestionCount: _interactive, unsectionedQuestionCount: _unsectioned, sourceCaseStudyIds: _provenance, ...legacy
+  } = expected
+  void [_id, _version, _mode, _actual, _target, _case, _standard, _interactive, _unsectioned, _provenance]
+  return same(saved, legacy)
 }
 
 function withCursor(attempt: ExamAttempt, view: CandidateSnapshot['candidateView']): CandidateSnapshot {
@@ -110,7 +127,7 @@ export function candidateValidators(source: FoundationSource) {
       if (cycle.id !== batch.cycleId || cycle.contentVersion !== batch.contentVersion || !isCycleLifecycle(cycle.lifecycle)) return false
       const active = activeExamCycle(cycle.lifecycle)
       return active.id === cycle.id && active.bankVersion === cycle.contentVersion
-        && active.batches.some((record) => same(record.batch, batch))
+        && active.batches.some((record) => samePinnedPlan(record.batch, batch))
     },
     validatePair(attempt: CandidateSnapshot, cycle: CandidateCycle) {
       const status = attempt.status === 'CREATED' || attempt.status === 'READY' ? 'GENERATED'
@@ -126,11 +143,6 @@ type CandidateChange = { readonly attempt: CandidateSnapshot; readonly cycle: Ca
 export function isRecoveryAction(action: FoundationAction): action is Exclude<FoundationAction, CandidateEdit> {
   return action.type === 'TAKE_OVER' || action.type === 'RETRY_SAVE' || action.type === 'DISCARD_UNSAVED'
 }
-
-type LegacyStatus = 'CASE_STUDY_1_SUBMITTED' | 'CASE_STUDY_2_SUBMITTED' | 'STANDARD_BLOCK_SUBMITTED' | 'INTERACTIVE_BLOCK_SUBMITTED'
-const shouldContinue = (status: CandidateSnapshot['status']): status is LegacyStatus =>
-  status === 'CASE_STUDY_1_SUBMITTED' || status === 'CASE_STUDY_2_SUBMITTED'
-  || status === 'STANDARD_BLOCK_SUBMITTED' || status === 'INTERACTIVE_BLOCK_SUBMITTED'
 
 /** Snapshot the deliberate action as one CAS. Section lock + next section
  * cannot be torn apart by quota errors, reloads, or a second tab. */
@@ -159,8 +171,12 @@ export function candidateChange(
     return true
   }
   const section = candidateSection(previous)
+  const sectionId = section ? examSectionKey(section) : undefined
+  const continueAfterSubmit = () => apply({
+    type: nextExistingSection(attempt) ? 'START_SECTION' : 'OPEN_FINAL_REVIEW',
+  })
   const activePosition = section?.questionIds[previous.position]
-  if ('sectionId' in action && action.sectionId !== undefined && section?.kind !== action.sectionId) return null
+  if ('sectionId' in action && action.sectionId !== undefined && sectionId !== action.sectionId) return null
   switch (action.type) {
     case 'START':
       if (previous.status !== 'CREATED' && previous.status !== 'READY') return null
@@ -187,17 +203,28 @@ export function candidateChange(
       if (view === previous.candidateView) return null
       break
     case 'SUBMIT_SECTION':
-      if (!section || !apply({ type: 'SUBMIT_SECTION', section: section.kind })) return null
+      if (!sectionId || !apply({ type: 'SUBMIT_SECTION', section: sectionId })) return null
       view = 'question'
-      if (!apply({ type: section.kind === 'FINAL_INTERACTIVE_BLOCK' ? 'OPEN_FINAL_REVIEW' : 'START_SECTION' })) return null
+      if (!continueAfterSubmit()) return null
       break
     case 'FINAL_SUBMIT':
       if (!apply({ type: 'FINAL_SUBMIT' }) || !track('COMPLETE')) return null
+      if (source.eligibleSourceIds?.length) {
+        const active = activeExamCycle(nextCycle.lifecycle)
+        const universe = new Set(source.eligibleSourceIds)
+        if (universe.size === source.eligibleSourceIds.length
+          && universe.size === active.consumedSourceIds.length
+          && active.consumedSourceIds.every((key) => universe.has(key))) {
+          const exhausted = transitionCycleLifecycle(nextCycle.lifecycle, {
+            type: 'COMPLETE_CYCLE', unusedEligibleSourceIds: [], at: now,
+          })
+          if (!exhausted.ok) return null
+          nextCycle = { ...nextCycle, lifecycle: exhausted.state }
+        }
+      }
       break
     case 'RESUME_BOUNDARY':
-      if (!shouldContinue(previous.status) || !apply({
-        type: previous.status === 'INTERACTIVE_BLOCK_SUBMITTED' ? 'OPEN_FINAL_REVIEW' : 'START_SECTION',
-      })) return null
+      if (!atSubmittedSectionBoundary(previous) || !continueAfterSubmit()) return null
       break
   }
   return {
@@ -207,5 +234,5 @@ export function candidateChange(
 }
 
 export function atIntermediateBoundary(attempt: CandidateSnapshot): boolean {
-  return shouldContinue(attempt.status)
+  return atSubmittedSectionBoundary(attempt)
 }

@@ -166,7 +166,7 @@ describe('phase 4 deterministic role allocation', () => {
   })
 })
 
-describe('phase 4 remainder and eligibility', () => {
+describe('flexible generation and eligibility', () => {
   it('keeps intact case groups, excludes held/reserved/consumed IDs, and does not fabricate a second family', () => {
     const bank = makeBank(3, 47, 4)
     const modified = { ...bank, caseStudies: bank.caseStudies.slice(0, 1) }
@@ -189,6 +189,33 @@ describe('phase 4 remainder and eligibility', () => {
     expect(out.diagnostics.constraints).toEqual([
       'CASE_STUDY_CHILDREN_EXHAUSTED', 'STANDARD_POOL_INSUFFICIENT', 'INTERACTIVE_POOL_EXHAUSTED',
     ])
+  })
+
+  it('keeps approved canonical case and interactive roles in adaptive composition even when standard also qualifies', () => {
+    const a = pool('overlap-case', 4, { standardEligible: true })
+    const inter = pool('overlap-hotspot', 5, { standardEligible: true, interactionKind: 'DROPDOWN_HOTSPOT', interactiveEligible: true })
+    const std = pool('standard', 59, { standardEligible: true })
+    const heldFamilyChild = question('unapproved-family-child', { standardEligible: true })
+    const bank = {
+      version: bankVersion, questions: [...a, ...inter, ...std, heldFamilyChild],
+      caseStudies: [family('approved', a.map(({ sourceId }) => sourceId)),
+        { ...family('unavailable', [heldFamilyChild.sourceId]), developmentValidated: false }],
+    }
+    const first = generated(input(bank, 10)).batch
+    expect(first).toMatchObject({
+      kind: 'ADAPTIVE_BATCH', batchMode: 'ADAPTIVE', total: 59, actualQuestionCount: 59, targetQuestionCount: 59,
+      caseStudyQuestionCount: 3, interactiveQuestionCount: 4, standardQuestionCount: 52, unsectionedQuestionCount: 0,
+    })
+    expect(first.batchId).toBe(first.id)
+    expect(first.bankVersion).toBe(first.contentVersion)
+    expect(Object.values(first.sourceCaseStudyIds)).toEqual(['approved', 'approved', 'approved'])
+    expect(first.sections.filter(({ kind }) => kind === 'STANDARD_BLOCK').flatMap(({ questionIds }) => questionIds)
+      .every((id) => !id.startsWith('overlap-'))).toBe(true)
+    const i = input(bank, 10)
+    const final = generated({ ...i, cycleState: { ...i.cycleState, consumedSourceIds: first.sourceIds } }).batch
+    expect(final).toMatchObject({ batchMode: 'FINAL_REMAINDER', actualQuestionCount: 10, caseStudyQuestionCount: 1, interactiveQuestionCount: 1 })
+    expect(final.sourceCaseStudyIds).not.toHaveProperty(heldFamilyChild.sourceId)
+    expect(new Set([...first.sourceIds, ...final.sourceIds])).toEqual(new Set(bank.questions.map(({ sourceId }) => sourceId)))
   })
 
   it('reports individual category shortages and a family with only two available children', () => {

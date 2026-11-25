@@ -1,5 +1,7 @@
 # Phase 4: deterministic batch and cycle engine
 
+> Historical baseline: the owner-approved [adaptive batch policy](ADAPTIVE-BATCH-EXHAUSTION.md) supersedes this phase’s old remainder and cycle-exhaustion rules. The original Phase 4 evidence remains unchanged.
+
 This branch builds on verified Phase 3. It adds a pure planner, exact capacity analysis, and a browser-local cycle controller. It adds no source data to the repository or release build, no account/backend/hosted database, and no deployment. The visible candidate page retains the Phase 2 layout and offers one generated **synthetic** preview; the new full registry is exercised separately in an actual Chromium IndexedDB test. A full candidate cycle UI, scoring, and publication are later work.
 
 ## Planner and eligibility

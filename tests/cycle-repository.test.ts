@@ -10,7 +10,10 @@ const bankVersion = 'bank-v1'
 const registryId = 'synthetic-registry'
 const cycleId = 'synthetic-cycle'
 const batch: GeneratedRemainderBatch = {
-  id: 'synthetic-plan', kind: 'FINAL_REMAINDER_BATCH', cycleId, contentVersion: bankVersion,
+  id: 'synthetic-plan', batchId: 'synthetic-plan', kind: 'FINAL_REMAINDER_BATCH', batchMode: 'FINAL_REMAINDER',
+  cycleId, contentVersion: bankVersion, bankVersion,
+  actualQuestionCount: 1, targetQuestionCount: 59, caseStudyQuestionCount: 0,
+  standardQuestionCount: 0, interactiveQuestionCount: 1, unsectionedQuestionCount: 0, sourceCaseStudyIds: {},
   seed: 'seed-a', eligibilityPolicy: 'DEVELOPMENT', mode: 'DEVELOPMENT',
   sourceIds: ['synthetic-item-a'], total: 1,
   sections: [{ kind: 'FINAL_INTERACTIVE_BLOCK', questionIds: ['synthetic-item-a'] }],
@@ -56,8 +59,12 @@ describe('writer-fenced cycle registry', () => {
     const retired = await open().load(registryId, bankVersion)
     if (!retired) throw new Error('Expected retired batch')
     expect(activeExamCycle(retired.state)).toMatchObject({
-      status: 'COMPLETE', consumedSourceIds: batch.sourceIds, reservedSourceIds: [],
+      status: 'ACTIVE', consumedSourceIds: batch.sourceIds, reservedSourceIds: [],
     })
+    await reopened.apply({ ...guard, expectedRevision: 3, command: {
+      type: 'COMPLETE_CYCLE', unusedEligibleSourceIds: [], at: ++now,
+    } })
+    expect((await open().load(registryId, bankVersion))?.state.cycles[0].status).toBe('COMPLETE')
     expect(Object.isFrozen(activeExamCycle(retired.state).batches[0].batch.optionOrder['synthetic-item-a'])).toBe(true)
   })
 
@@ -65,7 +72,7 @@ describe('writer-fenced cycle registry', () => {
     const guard = await initialize()
     const results = await Promise.allSettled([
       open().apply({ ...guard, command: { type: 'GENERATE', batch, at: now } }),
-      open().apply({ ...guard, command: { type: 'GENERATE', batch: { ...batch, id: 'competing' }, at: now } }),
+      open().apply({ ...guard, command: { type: 'GENERATE', batch: { ...batch, id: 'competing', batchId: 'competing' }, at: now } }),
     ])
     expect(results.filter((entry) => entry.status === 'fulfilled')).toHaveLength(1)
     expect(results.filter((entry) => entry.status === 'rejected')).toEqual([
