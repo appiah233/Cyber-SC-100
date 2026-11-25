@@ -127,3 +127,48 @@ describe('Phase 5 candidate command and storage boundary', () => {
     follower.close()
   })
 })
+
+
+describe('Phase 6 candidate finalization', () => {
+  const timed: FoundationSource = { ...source, examDurationMinutes: 1, eligibleSourceIds: previewBatch.sourceIds }
+
+  it('makes one configured deadline persist across sections and refuses boundary-local reviews after it', () => {
+    const draft = initialCandidate(timed, 100)
+    const start = candidateChange(draft.attempt, draft.cycle, timed, { type: 'START' }, 200)!
+    expect(start.attempt.startedAt).toBe(200)
+    expect(start.attempt.expiresAt).toBe(60_200)
+    const next = candidateChange(start.attempt, start.cycle, { ...timed, examDurationMinutes: 99 },
+      { type: 'SUBMIT_SECTION', sectionId: 'CASE_STUDY_1' }, 300)!
+    expect(next.attempt.expiresAt).toBe(start.attempt.expiresAt)
+    expect(next.attempt.activeSection).toBe('CASE_STUDY_2')
+    expect(candidateChange(next.attempt, next.cycle, timed, { type: 'OPEN_REVIEW' }, 60_200)).toBeNull()
+    const review = candidateChange(next.attempt, next.cycle, timed, { type: 'OPEN_REVIEW' }, 60_199)!
+    expect(review.attempt.candidateView).toBe('review')
+    expect(restoreCandidateCursor(structuredClone(review.attempt)).expiresAt).toBe(60_200)
+    const expired = candidateChange(review.attempt, review.cycle, timed, { type: 'TIME_EXPIRED' }, 60_500)!
+    expect(expired.attempt.status).toBe('SUBMITTED')
+    expect(expired.attempt.finalizationReason).toBe('TIME_EXPIRED')
+    expect(expired.attempt.submittedAt).toBe(60_500)
+    expect(expired.attempt.locks).toEqual(previewBatch.sections.map(section => section.kind))
+    expect(activeExamCycle(expired.cycle.lifecycle).status).toBe('COMPLETE')
+  })
+
+  it('pins captured option IDs in a detached final snapshot and never leaks a result', () => {
+    const draft = initialCandidate(timed, 100)
+    const start = candidateChange(draft.attempt, draft.cycle, timed, { type: 'START' }, 200)!
+    const id = start.attempt.currentQuestionId!
+    const display = candidateQuestion(timed, id).interaction
+    if (!('options' in display)) throw new Error('Expected a synthetic choice')
+    const option = display.options[0].id
+    const typed = candidateChange(start.attempt, start.cycle, timed,
+      { type: 'ANSWER', questionId: id, response: { selected: [option] } }, 60_198)!
+    const end = candidateChange(typed.attempt, typed.cycle, timed, { type: 'END_EXAM' }, 60_199)!
+    expect(end.attempt.finalizationReason).toBe('MANUAL_SUBMISSION')
+    expect(end.attempt.finalizedAnswerSnapshot?.answers[id]).toEqual(typed.attempt.answers[id])
+    expect(Object.isFrozen(end.attempt.finalizedAnswerSnapshot?.answers[id])).toBe(true)
+    expect(end.attempt.result).toBeNull()
+    expect(candidateChange(end.attempt, end.cycle, timed, { type: 'TIME_EXPIRED' }, 70_000)).toBeNull()
+    const tie = candidateChange(typed.attempt, typed.cycle, timed, { type: 'END_EXAM' }, 60_200)!
+    expect(tie.attempt.finalizationReason).toBe('TIME_EXPIRED')
+  })
+})

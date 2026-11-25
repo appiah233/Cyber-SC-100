@@ -1,10 +1,12 @@
-import { Component, useEffect, useRef, useState } from 'react'
+import { Component, useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Button, ConfirmDialog, Panel, Progress, Select, Status } from '../design-system/primitives'
 import { QuestionRenderer } from '../features/exam/QuestionRenderer'
+import { ExhibitViewer } from '../features/exam/ExhibitViewer'
 import { responseState } from '../features/exam/question-response'
 import type { DisplayInteraction, DisplayResponse } from '../features/exam/QuestionRenderer'
 import '../styles/exam.css'
+import '../styles/exam-lifecycle.css'
 
 export interface FoundationAsset {
   readonly id: string
@@ -57,6 +59,10 @@ export interface FoundationPreview {
   readonly hasUnsavedChange?: boolean
   readonly canRetrySave?: boolean
   readonly notice?: string
+  readonly timer?: { readonly remainingMs: number; readonly announcement?: string; readonly expired?: boolean }
+  readonly finalizationReason?: 'MANUAL_SUBMISSION' | 'TIME_EXPIRED'
+  readonly finalizing?: boolean
+  readonly examSummary?: { readonly unanswered: number; readonly marked: number }
 }
 
 export type FoundationAction =
@@ -67,7 +73,7 @@ export type FoundationAction =
   | { readonly type: 'TOGGLE_MARK'; readonly questionId: string }
   | { readonly type: 'OPEN_REVIEW' | 'CLOSE_REVIEW'; readonly sectionId?: string }
   | { readonly type: 'SUBMIT_SECTION'; readonly sectionId: string }
-  | { readonly type: 'FINAL_SUBMIT' }
+  | { readonly type: 'FINAL_SUBMIT' | 'END_EXAM' }
 
 const sampleQuestions: readonly FoundationQuestion[] = [
   {
@@ -114,35 +120,19 @@ function answerState(question: FoundationQuestion, answer: DisplayResponse | und
   } catch { return 'Unanswered' }
 }
 
-function approvedImageUrl(src: string | undefined): string | undefined {
-  if (!src || typeof window === 'undefined') return undefined
-  try {
-    const url = new URL(src, window.location.href)
-    if (url.username || url.password) return undefined
-    if ((url.protocol === 'https:' || url.protocol === 'http:' || url.protocol === 'blob:') &&
-        url.origin === window.location.origin) return url.href
-    if (/^data:image\/(?:png|jpeg|gif|webp|avif);base64,[A-Za-z0-9+/]+=*$/.test(src)) return src
-  } catch { /* A malformed exhibit is handled as unavailable. */ }
-  return undefined
-}
-
-function Exhibit({ asset }: { asset: FoundationAsset }) {
-  const [failed, setFailed] = useState(false)
-  const src = approvedImageUrl(asset.src)
-  return (
-    <figure className="exhibit">
-      <figcaption>{asset.label}</figcaption>
-      {src && !failed
-        ? <img src={src} alt={asset.alt?.trim() || asset.label} onError={() => setFailed(true)} referrerPolicy="no-referrer" />
-        : <p className="exhibit-unavailable" role="status">This exhibit image is unavailable.</p>}
-      {asset.description && <p>{asset.description}</p>}
-    </figure>
-  )
-}
-
-function Exhibits({ assets }: { assets?: readonly FoundationAsset[] }) {
+function Exhibits({ assets, onAvailabilityChange }: {
+  assets?: readonly FoundationAsset[]
+  onAvailabilityChange?: (asset: FoundationAsset, available: boolean) => void
+}) {
   if (!assets?.length) return null
-  return <div className="exhibit-list">{assets.map((asset) => <Exhibit key={JSON.stringify([asset.id, asset.src])} asset={asset} />)}</div>
+  return <div className="exhibit-list">{assets.map(asset => (
+    <ExhibitViewer key={asset.id} asset={asset} onAvailabilityChange={(_, available) => onAvailabilityChange?.(asset, available)} />
+  ))}</div>
+}
+
+function timerText(remainingMs: number): string {
+  const total = Number.isFinite(remainingMs) ? Math.max(0, Math.ceil(remainingMs / 1000)) : 0
+  return [Math.floor(total / 3600), Math.floor(total / 60) % 60, total % 60].map(n => String(n).padStart(2, '0')).join(':')
 }
 
 class QuestionBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
@@ -197,11 +187,24 @@ export default function App({ preview, onAction }: {
   onAction?: (action: FoundationAction) => void
 }) {
   const [sample, setSample] = useState(standalone)
-  const [dialog, setDialog] = useState<'section' | 'final' | null>(null)
+  const [dialog, setDialog] = useState<'section' | 'end' | 'final' | null>(null)
   const [filter, setFilter] = useState<ReviewFilter>('all')
   const [navFilter, setNavFilter] = useState<ReviewFilter>('all')
   const [navigatorOpen, setNavigatorOpen] = useState(() => matchesWidth(wideWorkspace))
   const [contextOpen, setContextOpen] = useState(() => matchesWidth(wideCasePane))
+  const [loadedExhibits, setLoadedExhibits] = useState<ReadonlyMap<string, string>>(() => new Map())
+  const recordExhibit = useCallback((asset: FoundationAsset, available: boolean) => {
+    const {id, src} = asset
+    if (!src) return
+    setLoadedExhibits(previous => {
+      if (available === (previous.get(id) === src)) return previous
+      const next = new Map(previous)
+      if (available) next.set(id, src)
+      else next.delete(id)
+      return next
+    })
+  }, [])
+  const exhibitLoaded = ({id, src}: FoundationAsset) => Boolean(src && loadedExhibits.get(id) === src)
   const headingRef = useRef<HTMLHeadingElement>(null)
   const navigatorSummaryRef = useRef<HTMLElement>(null)
   const dialogTrigger = useRef<HTMLButtonElement | null>(null)
@@ -230,8 +233,14 @@ export default function App({ preview, onAction }: {
   const overallPosition = Math.min(total, data.sections.slice(0, Math.max(0, activeIndex)).reduce((count, section) => count + section.count, 0)
     + Math.min(data.position + 1, sectionCount))
   const status = data.status ?? { label: 'Not saved' }
-  const actionsDisabled = data.readOnly === true || Boolean(preview && !onAction)
+  const expired = data.timer?.expired || (data.timer !== undefined && data.timer.remainingMs <= 0)
+  const actionsDisabled = data.readOnly === true || Boolean(data.finalizing || expired) || Boolean(preview && !onAction)
   const canCommit = Boolean(preview && onAction && !actionsDisabled && !data.hasUnsavedChange)
+  const showLifecycle = (isWorking || view === 'final') && Boolean(preview && onAction)
+  const displayTime = data.timer ? timerText(data.timer.remainingMs) : undefined
+  const finalUnanswered = data.examSummary?.unanswered ?? unansweredCount
+  const finalMarked = data.examSummary?.marked ?? markedCount
+  const endDescription = `This locks every section and saves your final responses. Unanswered or incomplete: ${finalUnanswered}. Marked for review: ${finalMarked}.${displayTime ? ' Time remaining: ' + displayTime + '.' : ''}`
   const isCase = caseSection(active)
   const isInteractive = sectionKind(active) === 'FINAL_INTERACTIVE_BLOCK'
   const finishLabel = isCase ? 'Finish case study' : isInteractive ? 'Finish interactive section' : 'Finish section'
@@ -350,8 +359,21 @@ export default function App({ preview, onAction }: {
             </div>
           </div>
         )}
+        {showLifecycle && (
+          <div className="exam-lifecycle" aria-label="Exam actions and time">
+            {displayTime && <span className="exam-timer" role="timer" aria-live="off" aria-label="Time remaining">
+              Time remaining <strong>{displayTime}</strong>
+            </span>}
+            {isWorking && <Button tone="quiet" disabled={!canCommit} onClick={event => {
+              dialogTrigger.current = event.currentTarget
+              setDialog('end')
+            }}>End exam</Button>}
+          </div>
+        )}
       </header>
       <main id="main-content" className={`layout-shell layout-shell--${view}`} tabIndex={-1}>
+        <p className="phase6-sr-only" role="status" aria-label="Exam timer announcements">{expired ? '' : data.timer?.announcement ?? ''}</p>
+        {showLifecycle && expired && !data.notice && <p role="alert" className="notice notice--warning">Time has expired. Your examination is being submitted.</p>}
         {(data.notice || (data.readOnly && data.canTakeOver) || data.hasUnsavedChange) && (
           <div className={`notice notice--${data.hasUnsavedChange || status.tone === 'error' ? 'error' : 'warning'}`} aria-label="Attempt notice">
             {(data.notice || data.hasUnsavedChange) && <p role={data.hasUnsavedChange ? 'alert' : 'status'}>{data.notice ?? 'A response could not be saved. Retry or discard the unsaved change before submitting.'}</p>}
@@ -406,7 +428,7 @@ export default function App({ preview, onAction }: {
                     <h3>{group.title}</h3>
                     {group.paragraphs.map((paragraph, position) => <p key={position}>{paragraph}</p>)}
                   </section>)}
-                  <Exhibits assets={data.context.assets} />
+                  <Exhibits assets={data.context.assets} onAvailabilityChange={recordExhibit} />
                 </div>
               </details>
             )}
@@ -431,11 +453,15 @@ export default function App({ preview, onAction }: {
                 <p className="prompt">{question.prompt}</p>
                 {Boolean(question.assets?.length) && <details className="exhibit-disclosure" open>
                   <summary>Question exhibits</summary>
-                  <Exhibits assets={question.assets} />
+                  <Exhibits assets={question.assets} onAvailabilityChange={recordExhibit} />
                 </details>}
                 <QuestionRenderer
                   questionKey={question.id}
                   interaction={question.interaction}
+                  availableExhibitIds={question.interaction.kind === 'DIAGRAM_DEPENDENT'
+                    && !(question.assets ?? []).every(exhibitLoaded) ? []
+                    : [...(question.assets ?? []), ...(data.context?.assets ?? [])]
+                      .filter(exhibitLoaded).map(asset => asset.id)}
                   response={data.answers?.[question.id] ?? {}}
                   onChange={(response) => act({ type: 'ANSWER', questionId: question.id, response })}
                   disabled={actionsDisabled}
@@ -534,7 +560,7 @@ export default function App({ preview, onAction }: {
           <Panel className="surface review complete-panel" label="Submission confirmation">
             <p className="eyebrow"><span aria-hidden="true">✓ </span>Submission recorded</p>
             <h1 ref={headingRef} tabIndex={-1}>Exam submitted</h1>
-            <p>The examination has been submitted. Your responses are no longer editable.</p>
+            <p>{data.finalizationReason === 'TIME_EXPIRED' ? 'Time expired. Your examination was submitted automatically and responses are locked.' : 'The examination has been submitted. Your responses are no longer editable.'}</p>
           </Panel>
         )}
 
@@ -555,17 +581,18 @@ export default function App({ preview, onAction }: {
       </main>
       <ConfirmDialog
         open={dialog !== null && canCommit}
-        title={dialog === 'final' ? 'Submit this exam?' : isCase ? 'Finish this case study?' : isInteractive ? 'Finish this interactive section?' : 'Finish this section?'}
-        description={dialog === 'final'
-          ? 'After you submit the exam, you cannot edit your responses.'
+        title={dialog === 'end' ? 'End this exam?' : dialog === 'final' ? 'Submit this exam?' : isCase ? 'Finish this case study?' : isInteractive ? 'Finish this interactive section?' : 'Finish this section?'}
+        description={dialog === 'final' || dialog === 'end'
+          ? endDescription
           : `${unansweredCount > 0 ? `You have ${unansweredCount} unanswered or incomplete ${unansweredCount === 1 ? 'question' : 'questions'}. ` : ''}After you submit this ${isCase ? 'case study' : 'section'}, you cannot return to ${sectionCount === 1 ? 'this question or change your answer' : 'these questions or change your answers'}.`}
-        confirmLabel={dialog === 'final' ? 'Submit exam' : isCase ? 'Submit case study' : 'Submit section'}
-        cancelLabel={dialog === 'final' || isCase ? 'Go back' : 'Return to review'}
+        confirmLabel={dialog === 'end' ? 'End and submit' : dialog === 'final' ? 'Submit exam' : isCase ? 'Submit case study' : 'Submit section'}
+        cancelLabel={dialog === 'end' ? 'Return to exam' : dialog === 'final' || isCase ? 'Go back' : 'Return to review'}
         onCancel={dismiss}
         onConfirm={() => {
           setDialog(null)
           if (!canCommit) return
           if (dialog === 'final' && view === 'final') act({ type: 'FINAL_SUBMIT' })
+          else if (dialog === 'end' && isWorking) act({ type: 'END_EXAM' })
           else if (active && view === 'review') act({ type: 'SUBMIT_SECTION', sectionId: active.id })
         }}
       />

@@ -2,16 +2,16 @@ import { Component, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import App from '../app/App'
 import type { FoundationAction, FoundationPreview } from '../app/App'
-import { examSectionKey } from '../domain'
+import { crossedExamWarning, examExpirationAt, examSectionKey, getRemainingTimeMs } from '../domain'
 import { readDisplayResponse } from '../features/exam/question-response'
 import { createExamRepository, StorageError } from '../storage'
 import type { SavedExam, WriterLease } from '../storage'
 import { ATTEMPT_ID, previewBatch, previewContext, previewQuestion, sectionTitles } from '../data/synthetic-preview'
 import {
-  atIntermediateBoundary, candidateChange, candidateQuestion, candidateSection, candidateValidators,
+  atIntermediateBoundary, candidateChange, candidateExamSummary, candidateQuestion, candidateSection, candidateValidators,
   initialCandidate, isRecoveryAction, restoreCandidateCursor,
 } from './candidate-attempt'
-import type { CandidateCycle, CandidateSnapshot, FoundationSource } from './candidate-attempt'
+import type { CandidateChange, CandidateCycle, CandidateEdit, CandidateSnapshot, FoundationSource } from './candidate-attempt'
 import { LEASE_MS, tabWriter } from './tab-writer'
 
 export type { FoundationSource } from './candidate-attempt'
@@ -31,6 +31,7 @@ type ViewState = {
   takeover?: boolean
   hasUnsavedChange?: boolean
   canRetrySave?: boolean
+  finalizing?: boolean
 }
 
 const opening: ViewState = { attempt: null, status: 'Opening browser storage…', readOnly: true }
@@ -48,6 +49,7 @@ class CandidateDisplayBoundary extends Component<{ children: ReactNode; fallback
 
 function CandidateSession({ source }: { source: FoundationSource }) {
   const [state, setState] = useState<ViewState>(opening)
+  const [timer, setTimer] = useState<FoundationPreview['timer']>()
   const dispatchRef = useRef<(action: FoundationAction) => void>(() => undefined)
   const displayFailed = useRef(false)
   const abortDisplay = useRef<() => void>(() => undefined)
@@ -68,40 +70,103 @@ function CandidateSession({ source }: { source: FoundationSource }) {
 
     const { attemptId } = source
     const version = source.batch.contentVersion
+    const warningMinutes = source.timerWarningMinutes ?? []
+    type Edit = { change: CandidateChange; base: number; baseCycleRevision: number; optimistic: boolean }
+    const edits: Edit[] = []
     let stopped = false
     let saved: SavedExam<CandidateSnapshot, CandidateCycle> | null = null
     let lease: WriterLease | null = null
     let identity: Awaited<ReturnType<typeof tabWriter>> | undefined
     let blocked: DisplayError | undefined
     let inFlight = false
-    let pending: { change: NonNullable<ReturnType<typeof candidateChange>>; revision: number; cycleRevision: number; optimistic: boolean } | null = null
+    let failed = false
+    let conflict = false
+    let dueAt: number | null = null
+    let lastRemaining: number | undefined
+    let announcement: string | undefined
+    let lastExpiryAttempt = -Infinity
+    let draining = false
     let tail: Promise<unknown> = Promise.resolve()
     const queue = (job: () => Promise<void>) => {
       tail = tail.catch(() => undefined).then(async () => { if (!stopped) await job() })
     }
-
-    const show = (status: string, notice?: string, take = false, optimistic?: CandidateSnapshot) => {
+    const projected = () => edits.at(-1)?.change ?? saved
+    const terminalQueued = () => edits.at(-1)?.change.attempt.status === 'SUBMITTED'
+    const finalizing = () => dueAt !== null || terminalQueued()
+    const expiresAt = () => projected()?.attempt.expiresAt
+    const baseMatches = () => !edits.length || (edits[0].base === saved?.attempt.revision
+      && edits[0].baseCycleRevision === saved.cycleRevision)
+    const show = (status: string, notice?: string, take = false) => {
       if (stopped) return
-      const canRetry = pending !== null && lease !== null
-        && pending.revision === saved?.attempt.revision && pending.cycleRevision === saved.cycleRevision
+      const freezing = finalizing() && saved?.attempt.status !== 'SUBMITTED'
+      // Do not reveal navigation, section locks, or a submission before its
+      // durable transaction has committed. Draft response values are controlled.
+      const optimistic = !freezing && lease && baseMatches()
+        ? edits.findLast((edit) => edit.optimistic)?.change.attempt : undefined
       setState({
-        attempt: optimistic ?? (canRetry && pending?.optimistic ? pending.change.attempt : saved?.attempt ?? null),
-        status, notice, error: blocked, readOnly: !lease || Boolean(pending) || Boolean(blocked),
-        takeover: take, hasUnsavedChange: Boolean(pending), canRetrySave: canRetry,
+        attempt: optimistic ?? saved?.attempt ?? null,
+        status, notice, error: blocked, finalizing: freezing,
+        readOnly: !lease || failed || Boolean(blocked) || freezing,
+        takeover: !freezing && take,
+        hasUnsavedChange: failed && !freezing && edits.length > 0,
+        canRetrySave: edits.length > 0 && Boolean(lease) && baseMatches() && !freezing,
       })
     }
-
+    const updateTimer = (at: number) => {
+      const remainingMs = getRemainingTimeMs(expiresAt(), at)
+      if (stopped || remainingMs === null || saved?.attempt.status === 'SUBMITTED') {
+        if (!stopped) setTimer(undefined)
+        return
+      }
+      if (dueAt !== null) announcement = 'Time has expired. Your examination is being submitted.'
+      else if (lastRemaining !== undefined) {
+        const minutes = crossedExamWarning(lastRemaining, remainingMs, warningMinutes)
+        if (minutes !== null) announcement = minutes + (minutes === 1 ? ' minute remaining.' : ' minutes remaining.')
+      }
+      lastRemaining = remainingMs
+      setTimer((previous) => previous && Math.ceil(previous.remainingMs / 1000) === Math.ceil(remainingMs / 1000)
+        && previous.expired === (dueAt !== null) && previous.announcement === announcement ? previous
+        : { remainingMs, expired: dueAt !== null, announcement })
+    }
+    const noticeExpiry = () => show(failed ? 'Submission not saved' : 'Submitting examination…', failed
+      ? 'This examination is locked while this tab retries submission. Keep this page open.'
+      : dueAt !== null ? 'Time has expired. Your examination is being submitted.' : undefined)
     const reconcile = (record: SavedExam<CandidateSnapshot, CandidateCycle> | null) => {
       saved = record ? { ...record, attempt: restoreCandidateCursor(record.attempt) } : null
+      if (edits.length && !baseMatches()) {
+        // A different fenced writer won. Never write these stale answers over
+        // a newer section or revision, and never pretend the stale edit saved.
+        conflict = true
+        if (saved?.attempt.status === 'SUBMITTED' || finalizing()) {
+          edits.length = 0
+          failed = false
+        }
+      }
     }
-
+    const observeExpiry = (at: number) => {
+      const current = projected()?.attempt
+      if (!saved || saved.attempt.status === 'SUBMITTED' || !current) return false
+      if (dueAt === null && current.status !== 'SUBMITTED'
+        && typeof current.expiresAt === 'number' && at >= current.expiresAt) {
+        dueAt = at
+        noticeExpiry()
+      }
+      return dueAt !== null
+    }
     const showPassive = () => {
+      if (saved?.attempt.status === 'SUBMITTED') {
+        show('Saved on this device', conflict
+          ? 'Another tab finalized this attempt. An unsaved change in this tab could not be added.' : undefined)
+        return
+      }
+      if (observeExpiry(Date.now())) { noticeExpiry(); return }
       const eligible = Boolean(saved && (!saved.lease || saved.lease.expiresAt <= Date.now()))
-      show('Read-only in this tab', eligible
-        ? 'The editing session has ended. Choose Take over editing to continue here.'
-        : 'This examination is open for editing in another tab. You can follow saved progress here without making changes.', eligible)
+      show('Read-only in this tab', conflict
+        ? 'The saved attempt changed in another tab. An unsaved action from this tab could not be added.'
+        : eligible
+          ? 'The editing session has ended. Choose Take over editing to continue here.'
+          : 'This examination is open for editing in another tab. You can follow saved progress here without making changes.', eligible)
     }
-
     const recover = async (error: unknown) => {
       if (stopped) return
       lease = null
@@ -114,7 +179,6 @@ function CandidateSession({ source }: { source: FoundationSource }) {
           error = loadError
         }
       }
-
       if (error instanceof StorageError && error.code === 'CONTENT_VERSION_MISMATCH') {
         blocked = {
           title: 'Saved content version cannot be resumed',
@@ -137,8 +201,6 @@ function CandidateSession({ source }: { source: FoundationSource }) {
       const previousLease = lease
       lease = null
       show('Content unavailable')
-      // No edits are accepted while content is unavailable. Drop a healthy
-      // lease here, but never overwrite a lease acquired by a later tab.
       try {
         if (previousLease) await repo.releaseWriter(attemptId, previousLease)
       } catch { /* The fence may already have expired; leave the durable attempt intact. */ }
@@ -148,10 +210,7 @@ function CandidateSession({ source }: { source: FoundationSource }) {
       displayFailed.current = true
       queue(releaseOnDisplayFailure)
     }
-
     const attachWriter = async (granted: WriterLease) => {
-      // Loading after acquire guards the read→grant race. Pair validation here
-      // also checks the persisted attempt against the actual Phase 4 batch status.
       const latest = await repo.load(attemptId, version)
       if (!latest || latest.lease?.writerId !== granted.writerId || latest.lease.token !== granted.token) {
         throw new StorageError('LEASE_LOST')
@@ -160,69 +219,157 @@ function CandidateSession({ source }: { source: FoundationSource }) {
       lease = latest.lease
     }
 
-    const save = async (edit: NonNullable<typeof pending>) => {
-      if (!lease || !saved) return
-      if (edit.revision !== saved.attempt.revision || edit.cycleRevision !== saved.cycleRevision) {
-        show('Save failed', 'The saved examination changed in another tab. Discard this unsaved change to continue.')
-        return
-      }
-      const { change } = edit
-      const cycleChanged = change.cycle !== saved.cycle
-      const durable = saved
-      // Make answer controls controlled by the tentative local value. Do not
-      // advance an exam boundary or new question until its save is durable.
-      if (pending === edit) pending = null
-      inFlight = true
-      show('Saving…', undefined, false, edit.optimistic ? change.attempt : undefined)
-      try {
-        const attempt = await repo.save({
-          attempt: change.attempt, expectedRevision: edit.revision, lease,
-          ...(cycleChanged ? { cycleUpdate: { cycle: change.cycle, expectedRevision: edit.cycleRevision } } : {}),
-        })
-        saved = {
-          ...durable, attempt: restoreCandidateCursor(attempt), cycle: change.cycle,
-          cycleRevision: durable.cycleRevision + (cycleChanged ? 1 : 0), lease,
-        }
-        show('Saved on this device')
-      } catch (error) {
-        pending = edit
-        if (error instanceof StorageError && ['UNAVAILABLE', 'QUOTA_EXCEEDED'].includes(error.code)) {
-          show('Save failed', error.message + ' Retry or discard this unsaved change before continuing.')
-        } else {
-          await recover(error)
-        }
-      } finally {
-        inFlight = false
-      }
+    async function resumeEditor(record: SavedExam<CandidateSnapshot, CandidateCycle>) {
+      if (!identity) throw new StorageError('LEASE_LOST')
+      // Resuming the Web-Lock-protected identity may renew its own expired
+      // fence without requiring a click. It can never displace another live
+      // tab, and expired sessions of a different tab remain opt-in.
+      const sameExpired = record.lease?.writerId === identity.id && record.lease.expiresAt <= Date.now()
+      await attachWriter(await repo.acquireWriter(attemptId, identity.id,
+        sameExpired ? { takeover: true, expectedToken: record.lease!.token } : undefined))
     }
 
-    const write = async (action: Exclude<FoundationAction, { type: 'TAKE_OVER' | 'RETRY_SAVE' | 'DISCARD_UNSAVED' }> | { type: 'RESUME_BOUNDARY' }) => {
-      if (!saved || !lease || pending || blocked || displayFailed.current) return
-      let change: ReturnType<typeof candidateChange>
+    const accept = (action: CandidateEdit | { type: 'TIME_EXPIRED' | 'RESUME_BOUNDARY' }, at: number) => {
+      const base = projected()
+      if (!saved || !base || !baseMatches()) return false
+      let change: CandidateChange | null
       try {
-        change = candidateChange(saved.attempt, saved.cycle, source, action, Date.now())
+        change = candidateChange(base.attempt, base.cycle, source, action, at)
       } catch {
-        // No response was committed against an unavailable question contract.
-        await releaseOnDisplayFailure()
-        return
+        queue(releaseOnDisplayFailure)
+        return false
       }
-      if (!change) return
-      await save({
-        change, revision: saved.attempt.revision, cycleRevision: saved.cycleRevision,
-        optimistic: action.type === 'ANSWER' || action.type === 'TOGGLE_MARK',
+      if (!change) return false
+      const baseCycleRevision = saved.cycleRevision + edits.filter((edit, index) =>
+        edit.change.cycle !== (index ? edits[index - 1].change.cycle : saved!.cycle)).length
+      edits.push({ change, base: base.attempt.revision, baseCycleRevision,
+        optimistic: action.type === 'ANSWER' || action.type === 'TOGGLE_MARK' })
+      return true
+    }
+
+    const acquireForExpiry = async () => {
+      if (!identity || !saved || saved.attempt.status === 'SUBMITTED') return false
+      if (lease && lease.expiresAt > Date.now()) return true
+      const latest = await repo.load(attemptId, version)
+      if (!latest) throw new StorageError('NOT_FOUND')
+      reconcile(latest)
+      if (latest.attempt.status === 'SUBMITTED') { showPassive(); return false }
+      if (latest.lease && latest.lease.expiresAt > Date.now() && latest.lease.writerId !== identity.id) return false
+      const expiredLease = latest.lease && latest.lease.expiresAt <= Date.now()
+      await attachWriter(await repo.acquireWriter(attemptId, identity.id,
+        expiredLease ? { takeover: true, expectedToken: latest.lease!.token } : undefined))
+      return true
+    }
+
+    const drain = async () => {
+      if (!saved || (blocked && blocked !== renderError)) return
+      observeExpiry(Date.now())
+      if ((blocked || displayFailed.current) && !finalizing()) return
+      if (saved.attempt.status === 'SUBMITTED') { showPassive(); return }
+      if (finalizing()) {
+        try {
+          if (!(await acquireForExpiry())) return
+          if (dueAt !== null && projected()?.attempt.status !== 'SUBMITTED') {
+            if (!baseMatches()) { edits.length = 0; conflict = true }
+            // Append timeout to all valid responses synchronously accepted
+            // before zero, including changes behind the failing write.
+            if (!accept({ type: 'TIME_EXPIRED' }, dueAt)) return
+          }
+        } catch (error) {
+          await recover(error)
+          return
+        }
+      }
+      while (lease && saved && edits.length && (!failed || finalizing()) && baseMatches()) {
+        const last = edits.at(-1)!
+        const terminal = last.change.attempt.status === 'SUBMITTED'
+        // Collapse undurable pre-cutoff work and the terminal action into
+        // a single lease-fenced revision. A transactional failure leaves the
+        // preceding durable state intact and the captured buffer retryable.
+        const count = terminal ? edits.length : 1
+        const change = terminal ? last.change : edits[0].change
+        const durable: SavedExam<CandidateSnapshot, CandidateCycle> = saved
+        const cycleChanged = change.cycle !== durable.cycle
+        try {
+          inFlight = true
+          if (terminal || finalizing()) noticeExpiry()
+          else show('Saving…')
+          const attempt = await repo.save({
+            attempt: { ...change.attempt, revision: durable.attempt.revision + 1 },
+            expectedRevision: durable.attempt.revision, lease,
+            ...(cycleChanged ? { cycleUpdate: { cycle: change.cycle, expectedRevision: durable.cycleRevision } } : {}),
+          })
+          const cycleRevision = durable.cycleRevision + (cycleChanged ? 1 : 0)
+          saved = { ...durable, attempt: restoreCandidateCursor(attempt), cycle: change.cycle, cycleRevision, lease }
+          edits.splice(0, count)
+          failed = false
+          if (attempt.status === 'SUBMITTED') {
+            dueAt = null
+            if (blocked === renderError) blocked = undefined
+            show('Saved on this device', conflict
+              ? 'An unsaved change from the previous editing session could not be added.' : undefined)
+            updateTimer(Date.now())
+            return
+          }
+          const observedAt = Date.now()
+          if (observeExpiry(observedAt) && projected()?.attempt.status !== 'SUBMITTED') {
+            if (!accept({ type: 'TIME_EXPIRED' }, dueAt!)) return
+          }
+          // Publish the persisted start/deadline immediately after the write.
+          updateTimer(observedAt)
+          if (!edits.length) show('Saved on this device')
+        } catch (error) {
+          failed = true
+          observeExpiry(Date.now())
+          if (error instanceof StorageError && ['UNAVAILABLE', 'QUOTA_EXCEEDED'].includes(error.code)) {
+            if (finalizing()) noticeExpiry()
+            else show('Save failed', error.message + ' Retry or discard this unsaved change before continuing.')
+          } else {
+            await recover(error)
+          }
+          return
+        } finally {
+          inFlight = false
+        }
+      }
+    }
+    const requestDrain = () => {
+      if (draining || stopped) return
+      draining = true
+      queue(async () => {
+        try { await drain() } finally { draining = false }
       })
+    }
+    const tick = () => {
+      const now = Date.now()
+      const due = observeExpiry(now)
+      updateTimer(now)
+      if (due || finalizing()) {
+        // Retry transient terminal persistence failures automatically. A
+        // follower may take over only to finalize, once the prior lease expires.
+        const elapsed = performance.now()
+        if (elapsed - lastExpiryAttempt >= 750) {
+          lastExpiryAttempt = elapsed
+          requestDrain()
+        }
+      }
     }
 
     const ready = async () => {
-      if (pending) {
-        const fresh = saved?.attempt.revision === pending.revision && saved.cycleRevision === pending.cycleRevision
-        show('Save failed', fresh ? 'Retry or discard the unsaved change to continue.'
-          : 'The saved examination changed in another tab. Discard the unsaved change to continue.')
-      } else if (saved && atIntermediateBoundary(saved.attempt)) {
-        await write({ type: 'RESUME_BOUNDARY' })
+      if (observeExpiry(Date.now()) || finalizing()) { await drain(); return }
+      if (edits.length) {
+        if (!failed && baseMatches()) await drain()
+        else {
+          failed = true
+          show('Save failed', baseMatches() ? 'Retry or discard the unsaved change to continue.'
+            : 'The saved examination changed in another tab. Discard the unsaved change to continue.')
+        }
+      } else if (saved && atIntermediateBoundary(saved.attempt) && accept({ type: 'RESUME_BOUNDARY' }, Date.now())) {
+        await drain()
       } else {
         show('Saved on this device')
       }
+      updateTimer(Date.now())
     }
 
     queue(async () => {
@@ -233,7 +380,8 @@ function CandidateSession({ source }: { source: FoundationSource }) {
         identity = await tabWriter()
         if (stopped) { identity.release(); return }
         if (record) {
-          await attachWriter(await repo.acquireWriter(attemptId, identity.id))
+          if (observeExpiry(Date.now())) { await drain(); return }
+          await resumeEditor(record)
         } else {
           try {
             const initial = initialCandidate(source, Date.now())
@@ -249,43 +397,79 @@ function CandidateSession({ source }: { source: FoundationSource }) {
       }
     })
 
-    dispatchRef.current = (action) => queue(async () => {
+    dispatchRef.current = (action) => {
       if (displayFailed.current || blocked) return
-      if (!isRecoveryAction(action)) { await write(action); return }
-      if (action.type === 'RETRY_SAVE') {
-        if (pending && lease) await save(pending)
-        return
-      }
-      if (action.type === 'DISCARD_UNSAVED') {
-        if (!pending) return
-        pending = null
-        if (lease) await ready()
-        else showPassive()
-        return
-      }
-      if (action.type === 'TAKE_OVER' && identity && !lease) {
-        try {
-          const record = await repo.load(attemptId, version)
-          if (!record) throw new StorageError('NOT_FOUND')
-          await attachWriter(await repo.acquireWriter(attemptId, identity.id, { takeover: true, expectedToken: record.lease?.token }))
-          await ready()
-        } catch (error) {
-          await recover(error)
+      const at = Date.now()
+      if (observeExpiry(at) || finalizing()) { requestDrain(); return }
+      if (!isRecoveryAction(action)) {
+        if (action.type === 'START' && source.examDurationMinutes !== undefined
+          && examExpirationAt(at, source.examDurationMinutes) === null) {
+          show('Examination did not start', 'The configured exam duration is invalid. No examination progress was changed.')
+          return
         }
+        // Timestamp and accept against the latest locally captured draft now,
+        // not when an older IndexedDB request or a throttled interval resumes.
+        if (!lease || failed || edits.some((edit) => !edit.optimistic) || !accept(action, at)) return
+        if (finalizing()) noticeExpiry()
+        else show('Saving…')
+        requestDrain()
+        return
       }
-    })
+      queue(async () => {
+        if (observeExpiry(Date.now()) || finalizing()) { await drain(); return }
+        if (action.type === 'RETRY_SAVE') {
+          if (edits.length && lease && baseMatches()) { failed = false; await drain() }
+          return
+        }
+        if (action.type === 'DISCARD_UNSAVED') {
+          if (!failed || !edits.length) return
+          edits.length = 0
+          failed = false
+          conflict = false
+          if (lease) await ready()
+          else showPassive()
+          return
+        }
+        if (action.type === 'TAKE_OVER' && identity && !lease) {
+          try {
+            const record = await repo.load(attemptId, version)
+            if (!record) throw new StorageError('NOT_FOUND')
+            await attachWriter(await repo.acquireWriter(attemptId, identity.id, { takeover: true, expectedToken: record.lease?.token }))
+            await ready()
+          } catch (error) {
+            await recover(error)
+          }
+        }
+      })
+    }
 
     const refresh = async (renew: boolean) => {
       if (!identity || blocked || displayFailed.current) return
       try {
+        if (observeExpiry(Date.now()) || finalizing()) { await drain(); return }
         if (lease) {
-          if (renew) lease = await repo.acquireWriter(attemptId, identity.id)
+          if (renew) {
+            if (lease.expiresAt <= Date.now()) {
+              const record = await repo.load(attemptId, version)
+              if (!record) throw new StorageError('NOT_FOUND')
+              await resumeEditor(record)
+              await ready()
+            } else lease = await repo.acquireWriter(attemptId, identity.id)
+          }
           return
         }
         const latest = await repo.load(attemptId, version)
         if (!latest) throw new StorageError('NOT_FOUND')
         reconcile(latest)
-        showPassive()
+        if (!observeExpiry(Date.now()) && latest.attempt.status !== 'SUBMITTED'
+          && latest.lease?.writerId === identity.id) {
+          await resumeEditor(latest)
+          await ready()
+        } else {
+          showPassive()
+          if (finalizing()) await drain()
+          updateTimer(Date.now())
+        }
       } catch (error) {
         await recover(error)
       }
@@ -294,16 +478,18 @@ function CandidateSession({ source }: { source: FoundationSource }) {
     const passivePoll = window.setInterval(() => {
       if (!lease) queue(() => refresh(false))
     }, 1_500)
-    const focused = () => queue(() => refresh(true))
+    const countdown = window.setInterval(tick, 250)
+    const focused = () => { tick(); queue(() => refresh(true)) }
     const pageHide = (event: PageTransitionEvent) => { if (!event.persisted) identity?.release() }
     const beforeUnload = (event: BeforeUnloadEvent) => {
-      if (pending || inFlight) {
+      if (edits.length || inFlight || finalizing()) {
         event.preventDefault()
         event.returnValue = ''
       }
     }
     window.addEventListener('focus', focused)
     window.addEventListener('pageshow', focused)
+    document.addEventListener('visibilitychange', focused)
     window.addEventListener('pagehide', pageHide)
     window.addEventListener('beforeunload', beforeUnload)
     return () => {
@@ -312,12 +498,12 @@ function CandidateSession({ source }: { source: FoundationSource }) {
       abortDisplay.current = () => undefined
       window.clearInterval(heartbeat)
       window.clearInterval(passivePoll)
+      window.clearInterval(countdown)
       window.removeEventListener('focus', focused)
       window.removeEventListener('pageshow', focused)
+      document.removeEventListener('visibilitychange', focused)
       window.removeEventListener('pagehide', pageHide)
       window.removeEventListener('beforeunload', beforeUnload)
-      // Keep the database fence for same-document reload safety; unlike the
-      // authoritatively time-fenced IndexedDB lease, the Web Lock is document-only.
       identity?.release()
       void tail.finally(() => repo.close()).catch(() => undefined)
     }
@@ -374,6 +560,9 @@ function CandidateSession({ source }: { source: FoundationSource }) {
     examTitle: source.examTitle,
     synthetic: source.synthetic,
     contentNotice: source.contentNotice,
+    timer,
+    finalizing: state.finalizing,
+    finalizationReason: attempt?.finalizationReason ?? undefined,
     status: { label: state.status, tone: state.error ? 'error' : state.notice ? 'warning' : 'neutral' },
     readOnly: state.readOnly || view === 'error',
     notice: state.notice,
@@ -389,6 +578,7 @@ function CandidateSession({ source }: { source: FoundationSource }) {
   let preview = basic
   let contentFailed = false
   try {
+    if (attempt && hasStarted && !complete) preview = { ...basic, examSummary: candidateExamSummary(source, attempt) }
     if (active && attempt && (view === 'question' || view === 'review')) {
       const questions = active.questionIds.map((id) => candidateQuestion(source, id))
       const questionId = view === 'question' ? active.questionIds[attempt.position] : undefined
@@ -398,7 +588,7 @@ function CandidateSession({ source }: { source: FoundationSource }) {
       const sourceCases = source.batch.sourceCaseStudyIds
       const contextId = active.caseStudyId ?? (questionId && Object.hasOwn(sourceCases, questionId) ? sourceCases[questionId] : undefined)
       preview = {
-        ...basic, questions,
+        ...preview, questions,
         context: contextId ? source.context?.(contextId) : undefined,
         answers: Object.fromEntries(questions.flatMap(({ id, interaction }) => {
           const display = readDisplayResponse(interaction, attempt.answers[id])

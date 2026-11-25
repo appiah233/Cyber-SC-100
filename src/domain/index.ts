@@ -1,6 +1,7 @@
 export * from './model'
 export * from './content'
 export * from './attempt'
+export * from './exam-timer'
 export * from './random'
 export { generateBatch, prepareBatchInventory, INTERACTIVE_PRIORITY } from './batch-engine'
 export type { BatchBank, BatchCycleState, BatchGenerationInput, BatchGenerationResult, GeneratedBatch, GeneratedNormalBatch, GeneratedAdaptiveBatch, GeneratedRemainderBatch, EligibilityPolicy, BatchGenerationFailure } from './batch-engine'
