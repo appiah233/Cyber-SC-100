@@ -24,11 +24,13 @@ const materialMarkers = [
 const bundledOnlyMarkers = [
   /\bREFERENCE[-_]BATCH[-_]\d+\b/i,
   /\b(?:PRIVATE_DEVELOPMENT_ONLY|PRIVATE_EXAM_CONTENT_CANARY)\b/,
+  /\bvirtual:local-candidate-display\b/,
   /(?:\/\/|\/\*)[#@]\s*sourceMappingURL\s*=/,
   /\b(?:private[-_](?:source[-_]?map|answer[-_]?key)|raw[-_]source[-_]pdf)\b/i,
 ];
 const privateJsonScope = /"scope"\s*:\s*"PRIVATE_DEVELOPMENT_ONLY"/;
 const privateReviewHtml = /<title>\s*Private source review\s*<\/title>/i;
+const localCandidateEvidence = /(?:^|\/)phase[-_]?5[-_]evidence(?:\/|$)/i;
 const unsafeSvg = /<\s*(?:script|foreignobject|iframe|object|embed)\b|\bon\w+\s*=|(?:xlink:)?href\s*=\s*["']\s*(?!#)[^"']+/i;
 const unsafeApplicationSink = /\bdangerouslySetInnerHTML\b|\.innerHTML\s*=|\.outerHTML\s*=|\.insertAdjacentHTML\s*\(|\bdocument\.write\s*\(/;
 const rootText = /\.(?:m?[jt]sx?|css|json|md|html?|ya?ml|toml|txt|svg|xml|py)$/i;
@@ -42,7 +44,7 @@ async function walk(dir, prefix, skipRootDirectories, records) {
     }
     if (entry.isDirectory()) {
       if (!prefix && skipRootDirectories?.has(entry.name)) continue;
-      if (privatePath.test(relative)) records.push({ relative, blockedDirectory: true });
+      if (privatePath.test(relative) || localCandidateEvidence.test(relative)) records.push({ relative, blockedDirectory: true });
       else await walk(resolve(dir, entry.name), relative, skipRootDirectories, records);
     } else {
       records.push({ relative, regular: entry.isFile(), absolute: resolve(dir, entry.name) });
@@ -104,7 +106,7 @@ export async function inspectPublicBoundary(directory, mode) {
       issues.push('unsupported-file-or-directory');
       continue;
     }
-    if (privatePath.test(relative)) {
+    if (privatePath.test(relative) || localCandidateEvidence.test(relative)) {
       issues.push('restricted-file-path');
       continue;
     }

@@ -1,9 +1,12 @@
 # Examination Hub
 
-Repository foundation. Feature implementation has not started.
+A browser-only practice examination. The public build uses **synthetic content** and has no backend, authentication, runtime API, or scoring. Local progress is saved in the browser. Building or testing the app does not deploy it.
 
-The planned application is static and runs in the browser. GitHub Pages is the intended deployment target; no deployment is configured or authorized. No backend, database, authentication, or runtime credentials.
+```sh
+npm ci
+npm run dev
+```
 
-Development stages: source intake and review, architecture and acceptance design, then implementation only after approval. Private source documents, answer keys, and extracted assets are not included in this repository.
+Open the Vite URL under `/Cyber-SC-100/`. Start explicitly, take the sections in order and review responses before submitting each section. A submitted section cannot be reopened through the app.
 
-See `docs/` for project structure and governance. No executable code or workflows are present at initialization.
+See [the Phase 5 runbook](docs/PHASE-5-CANDIDATE-EXAM.md) for local testing and the separate protected development workflow. Do not place any source PDF, answer keys, private question bank, or generated protected build in this repository, GitHub Actions, or GitHub Pages.

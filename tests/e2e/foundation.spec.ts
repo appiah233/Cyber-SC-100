@@ -14,8 +14,22 @@ async function openFoundation(page: Page) {
 
 async function startPractice(page: Page) {
   await openFoundation(page)
-  await page.getByRole('button', { name: 'Start practice exam' }).click()
+  await page.getByRole('button', { name: 'Start exam' }).click()
   await expect(page.getByRole('region', { name: 'Question and response' })).toBeVisible()
+}
+
+async function openNavigator(page: Page) {
+  const nav = page.getByRole('navigation', { name: 'Current section questions' })
+  if (!await nav.isVisible()) await page.getByText('Question navigator', { exact: true }).click()
+  await expect(nav).toBeVisible()
+  return nav
+}
+
+async function openOutline(page: Page) {
+  const sections = page.getByRole('list', { name: 'Exam sections' })
+  if (!await sections.isVisible()) await page.getByText('Exam sections and locks', { exact: true }).click()
+  await expect(sections).toBeVisible()
+  return sections
 }
 
 async function expectNoPageOverflow(page: Page) {
@@ -25,12 +39,24 @@ async function expectNoPageOverflow(page: Page) {
   })).toBeLessThanOrEqual(1)
 }
 
-for (const width of [320, 768, 1440]) {
+for (const width of [320, 375, 390, 768, 1024, 1440]) {
   test(`responsive built shell at ${width}px`, async ({ page }) => {
     await page.setViewportSize({ width, height: width < 600 ? 780 : 900 })
     await startPractice(page)
     await expectNoPageOverflow(page)
-    await expect(page.getByRole('main').getByRole('heading').first()).toBeVisible()
+    await expect(page.getByRole('main').getByRole('heading', { level: 1 })).toBeVisible()
+    for (let i = 0; i < 2; i += 1) {
+      await page.getByRole('button', { name: 'Review section', exact: true }).click()
+      await page.getByRole('button', { name: 'Finish case study', exact: true }).click()
+      await page.getByRole('dialog').getByRole('button', { name: 'Submit case study', exact: true }).click()
+    }
+    const region = page.getByRole('region', { name: 'Question and response' })
+    await expect(region.getByText('Question 1 of 49', { exact: true })).toBeVisible()
+    await openNavigator(page)
+    await expectNoPageOverflow(page)
+    await page.getByRole('button', { name: 'Review section', exact: true }).click()
+    await expect(page.getByRole('region', { name: 'Active section review' })).toBeVisible()
+    await expectNoPageOverflow(page)
     const screenshot = process.env.PLAYWRIGHT_SYNTHETIC_SCREENSHOT_PATH
     if (width === 1440 && screenshot) {
       await mkdir(dirname(screenshot), { recursive: true })
@@ -92,7 +118,7 @@ test('keyboard skip link, question navigation and lock dialog preserve focus', a
   await page.keyboard.press('Enter')
   await expect(page.getByRole('main')).toBeFocused()
 
-  const start = page.getByRole('button', { name: 'Start practice exam' })
+  const start = page.getByRole('button', { name: 'Start exam' })
   await expect(start).toBeEnabled()
   await start.focus()
   await page.keyboard.press('Enter')
@@ -106,12 +132,12 @@ test('keyboard skip link, question navigation and lock dialog preserve focus', a
   await expect(questionHeading).toBeFocused()
 
   await page.getByRole('button', { name: 'Review section' }).click()
-  const trigger = page.getByRole('button', { name: 'Submit and lock section' })
+  const trigger = page.getByRole('button', { name: /^Finish (?:case study|section|interactive section)$/i })
   await trigger.focus()
   await page.keyboard.press('Enter')
   const dialog = page.getByRole('dialog')
   await expect(dialog).toBeVisible()
-  await expect(dialog.getByRole('button', { name: 'Keep reviewing' })).toBeFocused()
+  await expect(dialog.getByRole('button', { name: 'Go back' })).toBeFocused()
   await expectNoAxeViolations(page)
   await page.keyboard.press('Escape')
   await expect(dialog).toBeHidden()
@@ -166,13 +192,15 @@ test('a saved answer and review mark survive reload and the submitted section st
   await expect(page.getByRole('button', { name: 'Marked for review', exact: true })).toHaveAttribute('aria-pressed', 'true')
 
   await page.getByRole('button', { name: 'Review section' }).click()
-  await page.getByRole('button', { name: 'Submit and lock section' }).click()
-  await page.getByRole('dialog').getByRole('button', { name: 'Submit and lock', exact: true }).click()
-  const sections = page.getByRole('list', { name: 'Exam sections' })
+  await page.getByRole('button', { name: /^Finish (?:case study|section|interactive section)$/i }).click()
+  await page.getByRole('dialog').getByRole('button', { name: /^Submit (?:case study|section)$/i }).click()
+  const sections = await openOutline(page)
   await expect(sections.getByRole('listitem').nth(0)).toContainText(/locked/i)
   await expect(sections.getByRole('listitem').nth(1)).toHaveAttribute('aria-current', 'step')
   await expect(page.getByRole('banner').getByRole('status')).toContainText(/saved/i)
   await page.reload()
+  await expect(page.getByRole('region', { name: 'Question and response' })).toBeVisible()
+  await openOutline(page)
   await expect(sections.getByRole('listitem').nth(0)).toContainText(/locked/i)
   await expect(sections.getByRole('listitem').nth(1)).toHaveAttribute('aria-current', 'step')
   await expect(page.getByRole('button', { name: 'Previous', exact: true })).toBeDisabled()
@@ -184,9 +212,9 @@ test('a separate tab with an active writer is visibly read-only', async ({ page,
   const second = await context.newPage()
   await openFoundation(second)
   await expect(second.getByRole('banner').getByRole('status')).toHaveText('Read-only in this tab')
-  await expect(second.getByRole('radio', { name: 'Sample option A' })).toBeDisabled()
+  await expect(second.getByLabel('Sample option A', { exact: true })).toBeDisabled()
   await expect(second.getByRole('button', { name: 'Next', exact: true })).toBeDisabled()
-  await expect(page.getByRole('radio', { name: 'Sample option A' })).toBeEnabled()
+  await expect(page.getByLabel('Sample option A', { exact: true })).toBeEnabled()
   await second.close()
 })
 
@@ -196,7 +224,8 @@ test('unavailable IndexedDB is visible and does not silently start a session', a
   })
   await openFoundation(page)
   await expect(page.getByRole('banner').getByRole('status')).toHaveText('Local storage unavailable')
-  await expect(page.getByRole('button', { name: 'Start practice exam' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Start exam' })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Reload exam' })).toBeEnabled()
 })
 
 test('all four locks lead to a separate final submission, with native accessible interactive controls', async ({ page }) => {
@@ -204,12 +233,14 @@ test('all four locks lead to a separate final submission, with native accessible
   const sections = page.getByRole('list', { name: 'Exam sections' })
   const lockCurrent = async () => {
     await page.getByRole('button', { name: 'Review section' }).click()
-    await page.getByRole('button', { name: 'Submit and lock section' }).click()
-    await page.getByRole('dialog').getByRole('button', { name: 'Submit and lock', exact: true }).click()
+    await page.getByRole('button', { name: /^Finish (?:case study|section|interactive section)$/i }).click()
+    await page.getByRole('dialog').getByRole('button', { name: /^Submit (?:case study|section)$/i }).click()
   }
   for (let section = 0; section < 3; section += 1) {
+    await openOutline(page)
     await expect(sections.getByRole('listitem').nth(section)).toHaveAttribute('aria-current', 'step')
     await lockCurrent()
+    await openOutline(page)
     await expect(sections.getByRole('listitem').nth(section)).toContainText('Locked')
     await expect(sections.getByRole('listitem').nth(section + 1)).toHaveAttribute('aria-current', 'step')
     await expect(page.getByRole('region', { name: 'Question and response' })).toBeVisible()
@@ -233,20 +264,21 @@ test('all four locks lead to a separate final submission, with native accessible
   await page.reload()
   await expect(first).toHaveValue('a')
   await expect(second).toHaveValue('b')
-  await page.getByRole('navigation', { name: 'Current section questions' }).getByRole('button', { name: /^Question 3,/ }).click()
+  await openNavigator(page)
+  await page.getByRole('navigation', { name: 'Current section questions' }).getByRole('button', { name: /^Question 3\b/ }).click()
   await expect(page.getByRole('heading', { name: 'Match sample items' })).toBeVisible()
-  await expect(page.getByText(/without dragging/i)).toBeVisible()
+  await expect(page.getByText(/no dragging is required/i)).toBeVisible()
   await first.selectOption('b')
   await expect(first).toHaveValue('b')
   await lockCurrent()
-  await expect(page.getByRole('heading', { name: 'Final review' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Final submission' })).toBeVisible()
   await expect(sections.getByRole('listitem').filter({ hasText: 'Locked' })).toHaveCount(4)
   await expect(page.getByRole('region', { name: 'Question and response' })).toHaveCount(0)
-  await page.getByRole('button', { name: 'Confirm final submission' }).click()
-  await page.getByRole('dialog').getByRole('button', { name: 'Submit attempt' }).click()
-  await expect(page.getByRole('heading', { name: 'Attempt submitted' })).toBeVisible()
+  await page.getByRole('button', { name: 'Submit exam' }).click()
+  await page.getByRole('dialog').getByRole('button', { name: 'Submit exam' }).click()
+  await expect(page.getByRole('heading', { name: 'Exam submitted' })).toBeVisible()
   await page.reload()
-  await expect(page.getByRole('heading', { name: 'Attempt submitted' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Exam submitted' })).toBeVisible()
 })
 
 test('a corrupted local snapshot fails closed without replacing saved data', async ({ page }) => {
@@ -277,7 +309,8 @@ test('a corrupted local snapshot fails closed without replacing saved data', asy
   expect(await accessLocalSnapshot(true)).toBe(-1)
   await page.reload()
   await expect(page.getByText(/could not be validated. Nothing was reset/i)).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Start practice exam' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Start exam' })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Reload exam' })).toBeEnabled()
   expect(await accessLocalSnapshot(false)).toBe(-1)
 })
 
@@ -296,7 +329,7 @@ for (const recovery of ['Retry save', 'Discard unsaved change'] as const) {
       }
     })
     await startPractice(page)
-    const radio = page.getByRole('radio', { name: 'Sample option A' })
+    const radio = page.getByLabel('Sample option A', { exact: true })
     await radio.click()
     const retry = page.getByRole('button', { name: 'Retry save', exact: true })
     const discard = page.getByRole('button', { name: 'Discard unsaved change', exact: true })
@@ -306,7 +339,7 @@ for (const recovery of ['Retry save', 'Discard unsaved change'] as const) {
     const review = page.getByRole('button', { name: 'Review section', exact: true })
     await expect(next).toBeDisabled()
     await expect(review).toBeDisabled()
-    await expect(page.getByRole('button', { name: 'Submit and lock section' })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: /^Finish (?:case study|section|interactive section)$/i })).toHaveCount(0)
 
     await (recovery === 'Retry save' ? retry : discard).click()
     await expect(retry).toHaveCount(0)
@@ -319,6 +352,6 @@ for (const recovery of ['Retry save', 'Discard unsaved change'] as const) {
       await expect(radio).not.toBeChecked()
     }
     await review.click()
-    await expect(page.getByRole('button', { name: 'Submit and lock section' })).toBeEnabled()
+    await expect(page.getByRole('button', { name: /^Finish (?:case study|section|interactive section)$/i })).toBeEnabled()
   })
 }
