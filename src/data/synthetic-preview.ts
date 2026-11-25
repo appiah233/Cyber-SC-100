@@ -106,7 +106,7 @@ export function previewContext(caseStudyId: string): FoundationPreview['context'
     paragraphs: [
       'The learning center is moving staff documents from shared workstations to a managed workspace. Staff at two sites collaborate on course materials.',
       'Course coordinators need to edit their own materials, while visiting instructors need time-limited read access. The operations team wants a clear record of access changes.',
-      'Use this fictional scenario to explore the controls. These practice items have no scoring key.',
+      'Use this fictional scenario to explore the controls. This is not an official examination.',
     ],
   }
   if (caseStudyId === 'demo-case-1') return {
@@ -114,7 +114,7 @@ export function previewContext(caseStudyId: string): FoundationPreview['context'
     paragraphs: [
       'Juniper Field Services dispatches maintenance crews to customer sites. Crews use shared tablets to view job notes, and dispatch staff use a separate scheduling workspace.',
       'A tablet may spend a day offline. Team leads must be able to see which updates were saved before a shift ended.',
-      'Use this fictional scenario to explore the controls. These practice items have no scoring key.',
+      'Use this fictional scenario to explore the controls. This is not an official examination.',
     ],
   }
   throw new Error('Unknown synthetic case context.')

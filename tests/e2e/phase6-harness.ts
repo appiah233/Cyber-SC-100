@@ -67,8 +67,8 @@ export async function servePhase6(profiles: readonly Phase6Profile[]) {
         name: 'phase6-qa-synthetic-source', enforce: 'pre',
         transform(code, path) {
           if (!path.endsWith('/src/main.tsx')) return undefined
-          const entry = '<Foundation />'
-          if (!code.includes(entry)) throw new Error('The Phase 6 harness needs the actual Foundation mount')
+          const entry = /<Foundation(?:\s+[^<>]*?)?\s*\/>/
+          if (!entry.test(code)) throw new Error('The Phase 6 harness needs the actual Foundation mount')
           return `import { phase6Fixture, phase6MatrixPositions } from ${JSON.stringify(fixture)};
 globalThis.__qaPhase6Positions = phase6MatrixPositions;
 ${code.replace(entry, '<Foundation source={phase6Fixture} />')}`

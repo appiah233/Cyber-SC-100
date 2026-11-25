@@ -13,7 +13,7 @@ const distAsset = /^assets\/[\w.-]+\.(?:js|css|svg)$/i;
 const firstPartyIcon = /^(?:favicon|exam-icon)\.svg$/i;
 
 // A denylist only catches known mistakes. Do not put private materials in the checkout.
-const privatePath = /(?:^|\/)(?:\.env(?:\.[^/]*)?|[^/]*\.(?:pdf|map|zip|tgz|tar|pem|pfx|p12|key|pyc)|\.?private(?:[-_.][^/]*)?|reference[-_]batch[-_]\d+(?:\.[^/]*)?|answer[-_]keys?(?:\.[^/]*)?|scoring[-_]bank\.json|review[-_]outputs?|sc100-x\d+-[a-f0-9]{16}\.png|sc100-q\d{3}-p\d{3}-exhibit-\d{2}-(?:crop-)?[a-f0-9]{16}\.png|id_rsa(?:\.pub)?|id_ed25519(?:\.pub)?)($|\/)/i;
+const privatePath = /(?:^|\/)(?:\.env(?:\.[^/]*)?|[^/]*\.(?:pdf|map|zip|tgz|tar|pem|pfx|p12|key|pyc)|\.?private(?:[-_.][^/]*)?|reference[-_]batch[-_]\d+(?:\.[^/]*)?|answer[-_]keys?(?:\.[^/]*)?|scoring[-_]bank\.json|candidate[-_]scoring\.[cm]?js|review[-_]outputs?|sc100-x\d+-[a-f0-9]{16}\.png|sc100-q\d{3}-p\d{3}-exhibit-\d{2}-(?:crop-)?[a-f0-9]{16}\.png|id_rsa(?:\.pub)?|id_ed25519(?:\.pub)?)($|\/)/i;
 const materialMarkers = [
   /(?:^|\b)%PDF-\d|data:application\/pdf|\bJVBERi0[A-Za-z0-9+/]{12,}/i,
   /["'](?:rawAnswer(?:Text|Block)?|rawExplanation|sourceAnswer|sourcePdfSha256)["']\s*:\s*["'][^"'\r\n]+/i,
@@ -22,8 +22,9 @@ const materialMarkers = [
   /\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|AKIA[A-Z0-9]{16}|xox[baprs]-[A-Za-z0-9-]{20,})\b/,
 ];
 const bundledOnlyMarkers = [
+  /\bcandidate[-_]scoring\.[cm]?js\b/i,
   /\bREFERENCE[-_]BATCH[-_]\d+\b/i,
-  /\b(?:PRIVATE_DEVELOPMENT_ONLY|PRIVATE_EXAM_CONTENT_CANARY)\b/,
+  /\b(?:PRIVATE_DEVELOPMENT_ONLY|PRIVATE_EXAM_CONTENT_CANARY|PRIVATE_EXAM_SCORING_CANARY)\b/,
   /\bvirtual:local-candidate-display\b/,
   /(?:\/\/|\/\*)[#@]\s*sourceMappingURL\s*=/,
   /\b(?:private[-_](?:source[-_]?map|answer[-_]?key)|raw[-_]source[-_]pdf)\b/i,

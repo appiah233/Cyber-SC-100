@@ -25,8 +25,14 @@ const within = (folder, file) => {
 }
 if (within(checkout, directory)) throw new Error('The protected bundle must be outside the checkout.')
 assertOutsideWorktree(directory)
-// Load exactly three known local files. Other assets, source/project paths, and
-// directory listings cannot be addressed. No request can write to disk.
+// Serve only known local files. The optional local scoring module is never
+// included in the default public build or fetched by an active candidate.
+try {
+  await lstat(join(directory, 'candidate-scoring.js'))
+  paths.set('/candidate-scoring.js', ['candidate-scoring.js', 'text/javascript; charset=utf-8'])
+} catch (error) {
+  if (error?.code !== 'ENOENT') throw error
+}
 const resources = new Map()
 for (const [url, [filename, contentType]] of paths) {
   const path = join(directory, filename)

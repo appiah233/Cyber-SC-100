@@ -172,3 +172,20 @@ test('candidate visual evidence is not part of the public checkout', () => withD
   await write(dir, { 'phase5-evidence/screenshots/start.png': 'synthetic image marker' });
   assert.deepEqual((await inspectPublicBoundary(dir, 'source')).issues, ['unsupported-file-or-directory']);
 }));
+
+test('blocks protected local scoring by path, route, and retained canary while permitting fictional scoring', () => withDirectory(async dir => {
+  await write(dir, {
+    'index.html': '<script type="module" src="./assets/main.js"></script>',
+    'assets/main.js': 'export const practice = () => import("./synthetic-practice-scoring.js");',
+    'assets/synthetic-practice-scoring.js': 'export const practice = { fictional: true };',
+  });
+  assert.deepEqual((await inspectPublicBoundary(dir, 'dist')).issues, []);
+  await write(dir, {
+    'assets/candidate-scoring.js': 'export default {};',
+    'assets/renamed.js': 'export const marker = "' + ['PRIVATE_EXAM', 'SCORING_CANARY'].join('_') + '";',
+    'assets/loader.js': 'const route = "' + ['candidate','scoring.js'].join('-') + '";',
+  });
+  assert.deepEqual((await inspectPublicBoundary(dir, 'dist')).issues, [
+    'restricted-bundle-marker', 'restricted-bundle-marker', 'restricted-file-path',
+  ]);
+}));
