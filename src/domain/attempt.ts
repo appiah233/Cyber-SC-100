@@ -7,11 +7,15 @@ import type {
   ExamAttempt,
   ExamBatch,
   ExamFinalizationReason,
+  ExamInteractionKinds,
   ExamResult,
   ExamSection,
   ExamSectionKey,
   ExamSectionKind,
   FinalizedAnswerSnapshot,
+  PinnedFinalizedAnswerSnapshot,
+  ScoreCounts,
+  ScoredExamResult,
   SourceQuestionId,
 } from './model'
 
@@ -179,6 +183,14 @@ export function validateExamBatch(batch: ExamBatch): BatchValidation {
   return { ok: true }
 }
 
+function copySections(sections: readonly ExamSection[]): readonly ExamSection[] {
+  return Object.freeze(sections.map(({ kind, questionIds, caseStudyId }) => Object.freeze({
+    kind,
+    questionIds: Object.freeze([...questionIds]),
+    ...(caseStudyId === undefined ? {} : { caseStudyId }),
+  })))
+}
+
 function copyBatch(batch: ExamBatch): ExamBatch {
   return Object.freeze({
     id: batch.id,
@@ -188,11 +200,7 @@ function copyBatch(batch: ExamBatch): ExamBatch {
     // Canonical Phase 5 snapshots predate batchMode. Keep their persisted
     // projection byte-for-byte compatible while pinning every variable plan.
     ...(batch.batchMode === undefined || batch.batchMode === 'NORMAL' ? {} : { batchMode: batch.batchMode }),
-    sections: Object.freeze(batch.sections.map(({ kind, questionIds, caseStudyId }) => Object.freeze({
-      kind,
-      questionIds: Object.freeze([...questionIds]),
-      ...(caseStudyId === undefined ? {} : { caseStudyId }),
-    }))),
+    sections: copySections(batch.sections),
   })
 }
 
@@ -201,11 +209,22 @@ function hasOnlyBatchIds(options: Readonly<Record<string, unknown>>, batch: Exam
   return Object.keys(options).every((questionId) => questionIds.has(questionId))
 }
 
+const knownInteractions = new Set([
+  'SINGLE_CHOICE', 'MULTIPLE_CHOICE', 'DROPDOWN', 'MATCHING', 'DRAG_DROP', 'ORDERING',
+  'STATEMENT', 'DROPDOWN_HOTSPOT', 'IMAGE_HOTSPOT', 'DIAGRAM_DEPENDENT',
+])
+
+function validInteractionKinds(kinds: unknown, questionIds: readonly string[]): kinds is ExamInteractionKinds {
+  return record(kinds) && Object.keys(kinds).length === questionIds.length && questionIds.every((sourceId) =>
+    Object.hasOwn(kinds, sourceId) && typeof kinds[sourceId] === 'string' && knownInteractions.has(kinds[sourceId]))
+}
+
 export function createAttempt(input: {
   readonly id: string
   readonly cycleId: string
   readonly batch: ExamBatch
   readonly optionOrder?: Readonly<Partial<Record<SourceQuestionId, readonly string[]>>>
+  readonly interactionKinds?: ExamInteractionKinds
   readonly at?: number
 }): ExamAttempt {
   const valid = validateExamBatch(input.batch)
@@ -218,6 +237,10 @@ export function createAttempt(input: {
     if (!uniqueIdList(values)) throw new Error('Invalid option order')
     return [key, Object.freeze([...values])]
   })))
+  const interactionKinds = input.interactionKinds
+  if (interactionKinds !== undefined && !validInteractionKinds(interactionKinds, input.batch.sections.flatMap((section) => section.questionIds))) {
+    throw new TypeError('Invalid pinned question interaction types')
+  }
   return Object.freeze({
     id: input.id,
     cycleId: input.cycleId,
@@ -231,6 +254,7 @@ export function createAttempt(input: {
     answers: Object.freeze({}),
     reviewMarks: Object.freeze({}),
     optionOrder,
+    ...(interactionKinds === undefined ? {} : { interactionKinds: Object.freeze({ ...interactionKinds }) }),
     updatedAt: input.at ?? null,
     submittedAt: null,
     result: null,
@@ -286,7 +310,7 @@ function copyAnswer(answer: CandidateAnswer): CandidateAnswer {
   return copyInteractionAnswer(answer)
 }
 
-function finalizedAnswers(attempt: ExamAttempt, submittedAt: number, reason: ExamFinalizationReason): FinalizedAnswerSnapshot {
+function phase6FinalizedAnswers(attempt: ExamAttempt, submittedAt: number, reason: ExamFinalizationReason): FinalizedAnswerSnapshot {
   const answers = Object.freeze(Object.fromEntries(Object.entries(attempt.answers).map(([key, answer]) => [key, copyAnswer(answer!)])))
   return Object.freeze({
     attemptId: attempt.id,
@@ -298,6 +322,45 @@ function finalizedAnswers(attempt: ExamAttempt, submittedAt: number, reason: Exa
     reason,
     answers,
   })
+}
+
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']'
+  if (record(value)) {
+    return '{' + Object.keys(value).sort().map((key) => JSON.stringify(key) + ':' + canonical(value[key])).join(',') + '}'
+  }
+  return JSON.stringify(value)
+}
+
+/** A local deterministic identifier, not an authenticity claim. Source and
+ * exact payload checks still apply; no browser-only record is tamper-proof. */
+function finalizedIdentity(payload: Omit<PinnedFinalizedAnswerSnapshot, 'snapshotId'>): string {
+  let hash = 0xcbf29ce484222325n
+  const raw = canonical(payload)
+  for (let i = 0; i < raw.length; i += 1) hash = BigInt.asUintN(64, (hash ^ BigInt(raw.charCodeAt(i))) * 0x100000001b3n)
+  return 'answers-v2-' + hash.toString(16).padStart(16, '0')
+}
+
+function pinFinalized(
+  base: FinalizedAnswerSnapshot, sections: readonly ExamSection[], kinds: ExamInteractionKinds,
+): PinnedFinalizedAnswerSnapshot {
+  const payload = {
+    ...base,
+    schemaVersion: 2 as const,
+    bankVersion: base.contentVersion,
+    finalizedAt: base.submittedAt,
+    finalizationReason: base.reason,
+    sections: copySections(sections),
+    interactionKinds: Object.freeze({ ...kinds }),
+  }
+  return Object.freeze({ ...payload, snapshotId: finalizedIdentity(payload) })
+}
+
+function finalizedAnswers(
+  attempt: ExamAttempt, submittedAt: number, reason: ExamFinalizationReason,
+): FinalizedAnswerSnapshot | PinnedFinalizedAnswerSnapshot {
+  const base = phase6FinalizedAnswers(attempt, submittedAt, reason)
+  return attempt.interactionKinds ? pinFinalized(base, attempt.batch.sections, attempt.interactionKinds) : base
 }
 
 function samePlain(left: unknown, right: unknown): boolean {
@@ -312,6 +375,32 @@ function samePlain(left: unknown, right: unknown): boolean {
     && entries.every(([key, item]) => Object.hasOwn(right, key) && samePlain(item, right[key]))
 }
 
+/** Validate even after JSON/structured clone; callers should take a frozen copy
+ * from getPinnedFinalizedAnswerSnapshot before invoking scoring. */
+export function isPinnedFinalizedAnswerSnapshot(value: unknown): value is PinnedFinalizedAnswerSnapshot {
+  if (!record(value) || value.schemaVersion !== 2 || !id(value.attemptId) || !id(value.cycleId)
+    || !id(value.batchId) || !id(value.contentVersion) || !id(value.snapshotId)
+    || !isTimestamp(value.submittedAt) || value.finalizedAt !== value.submittedAt || value.bankVersion !== value.contentVersion
+    || (value.reason !== 'MANUAL_SUBMISSION' && value.reason !== 'TIME_EXPIRED') || value.finalizationReason !== value.reason
+    || !uniqueIdList(value.questionIds) || !Array.isArray(value.sections) || !record(value.answers)) return false
+  const candidate: ExamBatch = {
+    id: value.batchId, contentVersion: value.contentVersion, sections: value.sections, seed: 'snapshot-validation',
+    batchMode: value.questionIds.length === NORMAL_QUESTION_COUNT ? 'ADAPTIVE' : 'FINAL_REMAINDER',
+  }
+  if (!validateNormalBatch({ ...candidate, batchMode: 'NORMAL' }).ok && !validateExamBatch(candidate).ok) return false
+  const questionIds = candidate.sections.flatMap((item) => item.questionIds)
+  if (!samePlain(questionIds, value.questionIds) || !validInteractionKinds(value.interactionKinds, questionIds)) return false
+  const kinds = value.interactionKinds
+  if (!hasOnlyBatchIds(value.answers, candidate) || !Object.entries(value.answers).every(([key, answer]) =>
+    validAnswer(answer) && answer.kind === kinds[key])) return false
+  const base: FinalizedAnswerSnapshot = {
+    attemptId: value.attemptId, cycleId: value.cycleId, batchId: value.batchId, contentVersion: value.contentVersion,
+    submittedAt: value.submittedAt, reason: value.reason, questionIds,
+    answers: Object.fromEntries(Object.entries(value.answers).map(([key, answer]) => [key, copyAnswer(answer as CandidateAnswer)])),
+  }
+  return samePlain(value, pinFinalized(base, candidate.sections, kinds))
+}
+
 function validResult(result: unknown, actualQuestionCount: number): result is ExamResult {
   return record(result)
     && typeof result.questionCount === 'number' && Number.isInteger(result.questionCount)
@@ -321,6 +410,88 @@ function validResult(result: unknown, actualQuestionCount: number): result is Ex
     && typeof result.percentage === 'number' && Number.isFinite(result.percentage)
     && result.percentage >= 0 && result.percentage <= 100
     && (result.scoringPolicyVersion === undefined || id(result.scoringPolicyVersion))
+}
+
+const countKeys = ['correctCount', 'incorrectCount', 'unansweredCount', 'questionCount'] as const
+const reviewPolicies = new Set(['NONE', 'RESPONSES_ONLY', 'CORRECTNESS', 'ANSWERS_AND_EXPLANATIONS'])
+
+function exactKeys(record: Readonly<Record<string, unknown>>, keys: readonly string[]) {
+  return Reflect.ownKeys(record).length === keys.length && keys.every((key) => Object.hasOwn(record, key))
+}
+
+function validScoreCounts(value: unknown): value is Readonly<Record<string, unknown>> & ScoreCounts {
+  if (!record(value) || !countKeys.every((key) =>
+    typeof value[key] === 'number' && Number.isSafeInteger(value[key]) && value[key] >= 0)) return false
+  const counts = value as unknown as ScoreCounts
+  return counts.correctCount + counts.incorrectCount + counts.unansweredCount === counts.questionCount
+}
+
+const scoredKeys = [
+  ...countKeys, 'schemaVersion', 'attemptId', 'batchId', 'snapshotId', 'bankVersion', 'scoringVersion',
+  'scoringPolicyVersion', 'rawScore', 'maximumScore', 'percentage', 'displayPercentage', 'passingPercentage',
+  'outcome', 'completedAt', 'finalizationReason', 'postExamReviewPolicy', 'sectionBreakdown', 'interactionTypeBreakdown',
+] as const
+
+function sumsMatch(groups: readonly Record<string, unknown>[], counts: ScoreCounts): boolean {
+  return countKeys.every((key) => groups.reduce((total, group) => total + Number(group[key]), 0) === counts[key])
+}
+
+/** Strict aggregate result, pinned to the exact local snapshot. This
+ * validates accounting and metadata without recomputing correctness. */
+export function isScoredExamResult(value: unknown, snapshot: PinnedFinalizedAnswerSnapshot): value is ScoredExamResult {
+  if (!isPinnedFinalizedAnswerSnapshot(snapshot) || !validScoreCounts(value) || !exactKeys(value, scoredKeys)
+    || value.schemaVersion !== 2 || value.attemptId !== snapshot.attemptId || value.batchId !== snapshot.batchId
+    || value.snapshotId !== snapshot.snapshotId || value.bankVersion !== snapshot.bankVersion
+    || !id(value.scoringVersion) || value.scoringPolicyVersion !== value.scoringVersion
+    || value.completedAt !== snapshot.finalizedAt || value.finalizationReason !== snapshot.finalizationReason
+    || typeof value.postExamReviewPolicy !== 'string' || !reviewPolicies.has(value.postExamReviewPolicy)
+    || value.questionCount !== snapshot.questionIds.length || value.maximumScore !== value.questionCount
+    || value.rawScore !== value.correctCount
+    || typeof value.percentage !== 'number' || value.percentage !== (100 * value.correctCount) / value.questionCount
+    || value.displayPercentage !== value.percentage.toFixed(2) + '%'
+    || typeof value.passingPercentage !== 'number' || !Number.isFinite(value.passingPercentage)
+    || value.passingPercentage < 0 || value.passingPercentage > 100
+    || value.outcome !== (value.percentage >= value.passingPercentage ? 'PASS' : 'FAIL')
+    || !Array.isArray(value.sectionBreakdown) || value.sectionBreakdown.length !== snapshot.sections.length
+    || !Array.isArray(value.interactionTypeBreakdown)) return false
+  const kindCounts = new Map<string, { total: number; unanswered: number }>()
+  for (const key of snapshot.questionIds) {
+    const kind = snapshot.interactionKinds[key]
+    const prior = kindCounts.get(kind) ?? { total: 0, unanswered: 0 }
+    kindCounts.set(kind, {
+      total: prior.total + 1,
+      unanswered: prior.unanswered + (Object.hasOwn(snapshot.answers, key) ? 0 : 1),
+    })
+  }
+  const unseenKinds = new Set(kindCounts.keys())
+  if (value.interactionTypeBreakdown.length !== unseenKinds.size
+    || !Array.from(value.sectionBreakdown).every((part, index) => {
+      const section = snapshot.sections[index]
+      return validScoreCounts(part) && exactKeys(part, [
+        ...countKeys, 'sectionId', 'sectionKind', ...(section.caseStudyId ? ['caseStudyId'] : []),
+      ]) && part.sectionId === examSectionKey(section) && part.sectionKind === section.kind
+        && part.caseStudyId === section.caseStudyId && part.questionCount === section.questionIds.length
+        && part.unansweredCount === section.questionIds.filter((key) => !Object.hasOwn(snapshot.answers, key)).length
+    }) || !Array.from(value.interactionTypeBreakdown).every((part) => {
+      if (!validScoreCounts(part) || !exactKeys(part, [...countKeys, 'interactionKind'])
+        || typeof part.interactionKind !== 'string' || !unseenKinds.delete(part.interactionKind)) return false
+      const counts = kindCounts.get(part.interactionKind)!
+      return part.questionCount === counts.total && part.unansweredCount === counts.unanswered
+    })) return false
+  return sumsMatch(value.sectionBreakdown, value) && sumsMatch(value.interactionTypeBreakdown, value)
+}
+
+function copyScoredResult(result: ScoredExamResult): ScoredExamResult {
+  return Object.freeze({
+    ...result,
+    sectionBreakdown: Object.freeze(result.sectionBreakdown.map((item) => Object.freeze({ ...item }))),
+    interactionTypeBreakdown: Object.freeze(result.interactionTypeBreakdown.map((item) => Object.freeze({ ...item }))),
+  })
+}
+
+function isLegacyResult(result: unknown, actualQuestionCount: number): result is ExamResult {
+  return validResult(result, actualQuestionCount) && Object.keys(result).every((key) =>
+    ['correctCount', 'questionCount', 'percentage', 'scoringPolicyVersion'].includes(key))
 }
 
 function hasExpectedLocks(locks: readonly string[], sections: readonly ExamSection[]): boolean {
@@ -393,7 +564,10 @@ export function transitionAttempt(attempt: ExamAttempt, event: AttemptEvent): Tr
     case 'SAVE_ANSWER': {
       if (!section) return fail('INVALID_TRANSITION')
       if (!section.questionIds.includes(event.questionId)) return fail('QUESTION_NOT_IN_ACTIVE_SECTION')
-      if (event.answer !== null && !validAnswer(event.answer)) return fail('INVALID_ANSWER')
+      if (event.answer !== null && (!validAnswer(event.answer)
+        || (attempt.interactionKinds && event.answer.kind !== attempt.interactionKinds[event.questionId]))) {
+        return fail('INVALID_ANSWER')
+      }
       const answers = { ...attempt.answers }
       if (event.answer === null) delete answers[event.questionId]
       else Object.defineProperty(answers, event.questionId, { value: copyAnswer(event.answer), enumerable: true })
@@ -445,9 +619,17 @@ export function transitionAttempt(attempt: ExamAttempt, event: AttemptEvent): Tr
       })
     }
     case 'RECORD_RESULT':
+      if (attempt.status === 'SCORED') return samePlain(attempt.result, event.result) ? { ok: true, attempt } : fail('INVALID_RESULT')
       if (attempt.status !== 'SUBMITTED') return fail('INVALID_TRANSITION')
-      if (!getFinalizedAnswerSnapshot(attempt)) return fail('INVALID_TRANSITION')
-      if (!validResult(event.result, sections.reduce((count, item) => count + item.questionIds.length, 0))) return fail('INVALID_RESULT')
+      {
+        const snapshot = getFinalizedAnswerSnapshot(attempt)
+        if (!snapshot) return fail('INVALID_TRANSITION')
+        if (isPinnedFinalizedAnswerSnapshot(snapshot)) {
+          if (!isScoredExamResult(event.result, snapshot)) return fail('INVALID_RESULT')
+          return next({ status: 'SCORED', result: copyScoredResult(event.result) })
+        }
+      }
+      if (!isLegacyResult(event.result, sections.reduce((count, item) => count + item.questionIds.length, 0))) return fail('INVALID_RESULT')
       return next({
         status: 'SCORED',
         result: Object.freeze({
@@ -474,9 +656,12 @@ export function isAttemptSnapshot(value: unknown): value is ExamAttempt {
     || !(value.updatedAt === null || isTimestamp(value.updatedAt))
     || !(value.submittedAt === null || isTimestamp(value.submittedAt))) return false
   const batch = value.batch as unknown as ExamBatch
+  const questionIds = batch.sections.flatMap((section) => section.questionIds)
+  const kinds = value.interactionKinds
+  if (kinds !== undefined && !validInteractionKinds(kinds, questionIds)) return false
   if (!hasOnlyBatchIds(value.answers, batch) || !hasOnlyBatchIds(value.reviewMarks, batch)
     || !hasOnlyBatchIds(value.optionOrder, batch)
-    || !Object.values(value.answers).every((answer) => validAnswer(answer))
+    || !Object.entries(value.answers).every(([key, answer]) => validAnswer(answer) && (!kinds || answer.kind === kinds[key]))
     || !Object.values(value.reviewMarks).every((mark) => typeof mark === 'boolean')
     || !Object.values(value.optionOrder).every(uniqueIdList)) return false
   const sections = batch.sections
@@ -503,20 +688,25 @@ export function isAttemptSnapshot(value: unknown): value is ExamAttempt {
     if (isTimestamp(expiresAt) && (!isTimestamp(startedAt) || expiresAt <= startedAt)) return false
     if (isTimestamp(expiresAt) && !isSubmitted && isTimestamp(value.updatedAt) && value.updatedAt >= expiresAt) return false
   }
+  let strictFinal: FinalizedAnswerSnapshot | PinnedFinalizedAnswerSnapshot | undefined
   if (isSubmitted) {
-    if (finalizationReason !== undefined || finalizedAnswerSnapshot !== undefined || startedAt !== undefined) {
+    if (finalizationReason !== undefined || finalizedAnswerSnapshot !== undefined || startedAt !== undefined || kinds !== undefined) {
       if (!isTimestamp(value.submittedAt) || !isTimestamp(value.updatedAt) || value.updatedAt < value.submittedAt
         || (isTimestamp(startedAt) && value.submittedAt < startedAt)
         || (finalizationReason !== 'MANUAL_SUBMISSION' && finalizationReason !== 'TIME_EXPIRED')
-        || (isTimestamp(expiresAt) && value.submittedAt >= expiresAt ? 'TIME_EXPIRED' : 'MANUAL_SUBMISSION') !== finalizationReason
-        || !samePlain(finalizedAnswerSnapshot, finalizedAnswers(value as unknown as ExamAttempt, value.submittedAt, finalizationReason))) {
+        || (isTimestamp(expiresAt) && value.submittedAt >= expiresAt ? 'TIME_EXPIRED' : 'MANUAL_SUBMISSION') !== finalizationReason) {
         return false
       }
+      strictFinal = finalizedAnswers(value as unknown as ExamAttempt, value.submittedAt, finalizationReason)
+      if (!samePlain(finalizedAnswerSnapshot, strictFinal)) return false
     }
   } else if ((finalizationReason !== undefined && finalizationReason !== null)
     || (finalizedAnswerSnapshot !== undefined && finalizedAnswerSnapshot !== null)) return false
-  const actualQuestionCount = sections.reduce((count, item) => count + item.questionIds.length, 0)
-  if (value.status === 'SCORED' ? !validResult(value.result, actualQuestionCount) : value.result !== null) return false
+  if (value.status === 'SCORED') {
+    if (strictFinal && 'schemaVersion' in strictFinal) {
+      if (!isScoredExamResult(value.result, strictFinal)) return false
+    } else if (!isLegacyResult(value.result, questionIds.length)) return false
+  } else if (value.result !== null) return false
   // Previous/current sections may have content; later sections may not.
   const touchedIds = new Set(sections.slice(0, lockCount + (progress ? 1 : 0))
     .flatMap(({ questionIds }) => questionIds))
@@ -529,17 +719,39 @@ export function isAttemptSnapshot(value: unknown): value is ExamAttempt {
 /** Restore the frozen terminal projection after structured-clone storage; old
  * timestamped submitted attempts are provably manual and can be upgraded
  * without applying new timer configuration or reopening their locks. */
-export function restoreAttemptFinalization(attempt: ExamAttempt): ExamAttempt {
+export function restoreAttemptFinalization(attempt: ExamAttempt, verifiedKinds?: ExamInteractionKinds): ExamAttempt {
   if (!isAttemptSnapshot(attempt) || (attempt.status !== 'SUBMITTED' && attempt.status !== 'SCORED')
     || !isTimestamp(attempt.submittedAt) || !isTimestamp(attempt.updatedAt) || attempt.updatedAt < attempt.submittedAt) return attempt
   const reason = attempt.finalizationReason ?? 'MANUAL_SUBMISSION'
-  const snapshot = finalizedAnswers(attempt, attempt.submittedAt, reason)
-  return Object.freeze({ ...attempt, answers: snapshot.answers, finalizationReason: reason, finalizedAnswerSnapshot: snapshot })
+  const questionIds = attempt.batch.sections.flatMap((section) => section.questionIds)
+  // An explicit pinned manifest can enrich a legacy terminal once without
+  // inventing a missing answer or reinterpreting an already-scored legacy result.
+  let kinds = attempt.interactionKinds
+  if (verifiedKinds !== undefined) {
+    if (!validInteractionKinds(verifiedKinds, questionIds)
+      || (kinds && !samePlain(kinds, verifiedKinds))
+      || !Object.entries(attempt.answers).every(([key, answer]) => answer?.kind === verifiedKinds[key])) return attempt
+    if (attempt.status === 'SUBMITTED' && !kinds) kinds = Object.freeze({ ...verifiedKinds })
+  }
+  const enriched = kinds ? { ...attempt, interactionKinds: kinds } : attempt
+  const snapshot = finalizedAnswers(enriched, attempt.submittedAt, reason)
+  const result = attempt.result && 'schemaVersion' in attempt.result
+    ? copyScoredResult(attempt.result as ScoredExamResult) : attempt.result && Object.freeze({ ...attempt.result })
+  return Object.freeze({ ...enriched, answers: snapshot.answers, finalizationReason: reason, finalizedAnswerSnapshot: snapshot, result })
 }
 
-/** This is an input gate for a future scorer, not a scoring implementation. */
-export function getFinalizedAnswerSnapshot(attempt: ExamAttempt): FinalizedAnswerSnapshot | null {
+/** Phase 6-compatible terminal getter, but callers must use the pinned gate to score. */
+export function getFinalizedAnswerSnapshot(attempt: ExamAttempt): FinalizedAnswerSnapshot | PinnedFinalizedAnswerSnapshot | null {
   if (!isAttemptSnapshot(attempt) || (attempt.status !== 'SUBMITTED' && attempt.status !== 'SCORED')
     || !attempt.finalizationReason || !isTimestamp(attempt.submittedAt)) return null
   return finalizedAnswers(attempt, attempt.submittedAt, attempt.finalizationReason)
+}
+
+/** No active or incomplete/unknown-kind snapshot reaches the scorer. The
+ * optional verified map belongs to an already-pinned matching source plan. */
+export function getPinnedFinalizedAnswerSnapshot(attempt: ExamAttempt, verifiedKinds?: ExamInteractionKinds): PinnedFinalizedAnswerSnapshot | null {
+  if (verifiedKinds !== undefined && attempt.interactionKinds !== undefined && !samePlain(verifiedKinds, attempt.interactionKinds)) return null
+  const restored = verifiedKinds === undefined ? attempt : restoreAttemptFinalization(attempt, verifiedKinds)
+  const snapshot = getFinalizedAnswerSnapshot(restored)
+  return snapshot && 'schemaVersion' in snapshot ? snapshot : null
 }

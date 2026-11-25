@@ -8,6 +8,7 @@ import process from 'node:process'
 import react from '@vitejs/plugin-react'
 import { build } from 'vite'
 import { assertOutsideWorktree } from './local-boundary.mjs'
+import { projectProtectedScoring } from './local-score-projection.mjs'
 
 const repo = await realpath(fileURLToPath(new URL('../../', import.meta.url)))
 const pinned = new Map([
@@ -15,6 +16,7 @@ const pinned = new Map([
   ['display-bank.json', '7bc33e3ebe4b26ea6f81cae502688a64ec3e921572d7c735d1a44787a82cfb49'],
   ['reference-batch.json', 'c69b4afef51b46ab28b937c9603573a1ebc8c86b1517a93c31c3fce92b26eb48'],
 ])
+const scoringPin = 'fcfae55a1f79077c87839f0a1da863018cdc875ebde8f9f63e966a11e71302ce'
 const version = 'sc100-c1afae23f990-7cab33ce7722'
 const contained = (dir, path) => {
   const rel = relative(dir, path)
@@ -47,9 +49,19 @@ function localExamTiming(env) {
 }
 
 
+function localScoringPolicy(env) {
+  const value = env.EXAM_PASSING_PERCENTAGE
+  if (value === undefined) return undefined
+  if (!/^(?:0|[1-9]\d{0,2})(?:\.\d{1,4})?$/.test(value)) throw new Error('Invalid configured passing percentage.')
+  const passingPercentage = Number(value)
+  if (passingPercentage < 0 || passingPercentage > 100) throw new Error('Invalid configured passing percentage.')
+  return { passingPercentage, scoringVersion: 'phase7-exact-v1-p' + String(passingPercentage).replace('.', '_'), postExamReviewPolicy: 'NONE' }
+}
+
 async function main() {
   localOnly()
   const examTiming = localExamTiming(process.env)
+  const scoringPolicy = localScoringPolicy(process.env)
   const [, , input, output, ...extra] = process.argv
   if (!input || !output || extra.length) throw new Error('Supply an external approved bank directory and a new external output directory.')
   const bankDir = await realpath(resolve(input))
@@ -58,16 +70,17 @@ async function main() {
     || contained(outDir, repo) || contained(outDir, bankDir)) throw new Error('Keep inputs and output separate and outside the checkout.')
   assertOutsideWorktree(bankDir)
   assertOutsideWorktree(dirname(outDir))
-  const read = async (name) => {
+  const read = async (name, expected = pinned.get(name)) => {
     const path = join(bankDir, name)
     const stat = await lstat(path)
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4 * 1024 * 1024) throw new Error('Invalid pinned input.')
+    if (!stat.isFile() || stat.isSymbolicLink() || path !== await realpath(path) || stat.size > 4 * 1024 * 1024) throw new Error('Invalid pinned input.')
     const bytes = await readFile(path)
-    if (sha256(bytes) !== pinned.get(name)) throw new Error('A protected input failed its digest check.')
+    if (sha256(bytes) !== expected) throw new Error('A protected input failed its digest check.')
     return JSON.parse(bytes.toString('utf8'))
   }
   // Check all input bytes before any browser artifact can be produced.
-  const [bank, display, reference] = await Promise.all([...pinned.keys()].map(read))
+  const [bank, display, reference] = await Promise.all([...pinned.keys()].map(name => read(name)))
+  const scoringInput = scoringPolicy ? await read('scoring-bank.json', scoringPin) : undefined
   const scratch = await mkdtemp(join(tmpdir(), 'examination-candidate-'))
   let created = false
   try {
@@ -103,7 +116,8 @@ async function main() {
         asset.src = src
       }
     }
-    const serialized = JSON.stringify({ ...payload, ...(examTiming ? { examTiming } : {}) })
+    const sealed = scoringPolicy ? projectProtectedScoring(payload, bank, scoringInput) : undefined
+    const serialized = JSON.stringify({ ...payload, ...(examTiming ? { examTiming } : {}), ...(scoringPolicy ? { scoringPolicy } : {}) })
     if (/"(?:rawAnswer|rawExplanation|answerDefinitions|sourceAnswer|expectedAnswer|score|passThreshold|sourceDocumentChecksum)"/i.test(serialized)) {
       throw new Error('Unexpected non-display data.')
     }
@@ -125,7 +139,7 @@ async function main() {
         cssCodeSplit: false,
         rolldownOptions: {
           input: runner,
-          output: { entryFileNames: 'candidate.js', assetFileNames: 'candidate.[ext]' },
+          output: { entryFileNames: 'candidate.js', assetFileNames: 'candidate.[ext]', codeSplitting: false },
         },
       },
     })
@@ -144,8 +158,14 @@ async function main() {
 <script type="module" src="./candidate.js"></script>
 </head><body><div id="root"></div><noscript>Enable JavaScript to open the local practice examination.</noscript></body></html>
 `, { mode: 0o600 })
+    if (sealed) {
+      // Kept out of the candidate/display bundle. Same-origin load happens only
+      // at the durable terminal gate; a static server cannot promise key secrecy
+      // against someone who explicitly fetches its development-only path.
+      await writeFile(join(outDir, 'candidate-scoring.js'), 'export default ' + JSON.stringify(sealed) + ';\n', { mode: 0o600 })
+    }
     await Promise.all(['candidate.js', 'candidate.css'].map(name => chmod(join(outDir, name), 0o600)))
-    console.log('Built the protected local candidate: 59 questions, 2 case contexts, no scoring data. No network delivery or deployment.')
+    console.log('Built the protected local candidate: 59 questions, 2 case contexts. ' + (sealed ? 'Separate local-only scoring module; ' : 'Scoring disabled; ') + 'no network delivery or deployment.')
   } catch (cause) {
     if (created) await rm(outDir, { recursive: true, force: true })
     throw cause

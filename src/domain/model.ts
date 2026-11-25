@@ -179,8 +179,47 @@ export interface ExamResult {
 }
 
 export type ExamFinalizationReason = 'MANUAL_SUBMISSION' | 'TIME_EXPIRED'
+export type PostExamReviewPolicy = 'NONE' | 'RESPONSES_ONLY' | 'CORRECTNESS' | 'ANSWERS_AND_EXPLANATIONS'
 
-/** Candidate data only. Missing answers are left absent, never manufactured. */
+export interface ScoreCounts {
+  readonly correctCount: number
+  readonly incorrectCount: number
+  readonly unansweredCount: number
+  readonly questionCount: number
+}
+
+export interface SectionScore extends ScoreCounts {
+  readonly sectionId: ExamSectionKey
+  readonly sectionKind: ExamSectionKind
+  readonly caseStudyId?: string
+}
+
+export interface InteractionScore extends ScoreCounts {
+  readonly interactionKind: QuestionInteraction['kind']
+}
+
+/** Aggregate result only; this record is never an answer-review payload. */
+export interface ScoredExamResult extends ExamResult, ScoreCounts {
+  readonly schemaVersion: 2
+  readonly attemptId: string
+  readonly batchId: string
+  readonly snapshotId: string
+  readonly bankVersion: ContentVersion
+  readonly scoringVersion: string
+  readonly scoringPolicyVersion: string
+  readonly rawScore: number
+  readonly maximumScore: number
+  readonly displayPercentage: string
+  readonly passingPercentage: number
+  readonly outcome: 'PASS' | 'FAIL'
+  readonly completedAt: number
+  readonly finalizationReason: ExamFinalizationReason
+  readonly postExamReviewPolicy: PostExamReviewPolicy
+  readonly sectionBreakdown: readonly SectionScore[]
+  readonly interactionTypeBreakdown: readonly InteractionScore[]
+}
+
+/** Phase 6 compatibility shape. Candidate data only; missing answers stay absent. */
 export interface FinalizedAnswerSnapshot {
   readonly attemptId: string
   readonly cycleId: string
@@ -190,6 +229,18 @@ export interface FinalizedAnswerSnapshot {
   readonly submittedAt: number
   readonly reason: ExamFinalizationReason
   readonly answers: Readonly<Partial<Record<SourceQuestionId, CandidateAnswer>>>
+}
+
+export type ExamInteractionKinds = Readonly<Record<SourceQuestionId, QuestionInteraction['kind']>>
+
+export interface PinnedFinalizedAnswerSnapshot extends FinalizedAnswerSnapshot {
+  readonly schemaVersion: 2
+  readonly snapshotId: string
+  readonly bankVersion: ContentVersion
+  readonly finalizedAt: number
+  readonly finalizationReason: ExamFinalizationReason
+  readonly sections: readonly ExamSection[]
+  readonly interactionKinds: ExamInteractionKinds
 }
 
 export type AttemptStatus =
@@ -215,12 +266,14 @@ export interface ExamAttempt {
   readonly answers: Readonly<Partial<Record<SourceQuestionId, CandidateAnswer>>>
   readonly reviewMarks: Readonly<Partial<Record<SourceQuestionId, boolean>>>
   readonly optionOrder: Readonly<Partial<Record<SourceQuestionId, readonly OptionId[]>>>
+  /** Pinned by the verified plan, never inferred from which items were answered. */
+  readonly interactionKinds?: ExamInteractionKinds
   readonly updatedAt: number | null
   readonly submittedAt: number | null
   /** Undefined is the validated pre-timer, untimed storage format. */
   readonly startedAt?: number | null
   readonly expiresAt?: number | null
   readonly finalizationReason?: ExamFinalizationReason | null
-  readonly finalizedAnswerSnapshot?: FinalizedAnswerSnapshot | null
-  readonly result: ExamResult | null
+  readonly finalizedAnswerSnapshot?: FinalizedAnswerSnapshot | PinnedFinalizedAnswerSnapshot | null
+  readonly result: ExamResult | ScoredExamResult | null
 }

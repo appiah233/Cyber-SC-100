@@ -275,10 +275,10 @@ test('all four locks lead to a separate final submission, with native accessible
   await expect(sections.getByRole('listitem').filter({ hasText: 'Locked' })).toHaveCount(4)
   await expect(page.getByRole('region', { name: 'Question and response' })).toHaveCount(0)
   await page.getByRole('button', { name: 'Submit exam' }).click()
-  await page.getByRole('dialog').getByRole('button', { name: 'Submit exam' }).click()
-  await expect(page.getByRole('heading', { name: 'Exam submitted' })).toBeVisible()
+  await page.getByRole('dialog').getByRole('button', { name: 'End and submit' }).click()
+  await expect(page.getByRole('heading', { name: 'Exam complete' })).toBeVisible()
   await page.reload()
-  await expect(page.getByRole('heading', { name: 'Exam submitted' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Exam complete' })).toBeVisible()
 })
 
 test('a corrupted local snapshot fails closed without replacing saved data', async ({ page }) => {

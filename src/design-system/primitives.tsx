@@ -32,13 +32,14 @@ export function Select({ label, children, ...props }: SelectHTMLAttributes<HTMLS
 }
 
 export function ConfirmDialog({
-  open, title, description, confirmLabel, onCancel, onConfirm, cancelLabel = 'Keep reviewing',
+  open, title, description, summary, confirmLabel, onCancel, onConfirm, cancelLabel = 'Keep reviewing',
 }: {
   open: boolean; title: string; description: string; confirmLabel: string
-  onCancel: () => void; onConfirm: () => void; cancelLabel?: string
+  onCancel: () => void; onConfirm: () => void; cancelLabel?: string; summary?: ReactNode
 }) {
   const titleId = useId()
   const descriptionId = useId()
+  const summaryId = useId()
   const ref = useRef<HTMLDialogElement>(null)
   const cancelRef = useRef<HTMLButtonElement>(null)
   const confirmRef = useRef<HTMLButtonElement>(null)
@@ -58,7 +59,7 @@ export function ConfirmDialog({
       ref={ref}
       className="dialog"
       aria-labelledby={titleId}
-      aria-describedby={descriptionId}
+      aria-describedby={summary ? descriptionId + ' ' + summaryId : descriptionId}
       onCancel={(event) => { event.preventDefault(); onCancel() }}
       onKeyDown={(event) => {
         if (event.key !== 'Tab') return
@@ -75,6 +76,7 @@ export function ConfirmDialog({
     >
       <h2 id={titleId}>{title}</h2>
       <p id={descriptionId}>{description}</p>
+      {summary && <div id={summaryId}>{summary}</div>}
       <div className="dialog-actions">
         <button ref={cancelRef} className="button button--neutral" type="button" onClick={onCancel}>{cancelLabel}</button>
         <button ref={confirmRef} className="button button--primary" type="button" onClick={onConfirm}>{confirmLabel}</button>

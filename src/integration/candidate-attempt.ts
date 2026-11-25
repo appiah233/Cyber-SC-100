@@ -1,7 +1,8 @@
 import type { FoundationAction, FoundationPreview, FoundationQuestion } from '../app/App'
 import { atSubmittedSectionBoundary, createAttempt, examSectionKey, isAttemptSnapshot, nextExistingSection, restoreAttemptFinalization, transitionAttempt } from '../domain'
-import type { AttemptEvent, ExamAttempt } from '../domain'
+import type { AttemptEvent, ExamAttempt, ScoredExamResult } from '../domain'
 import type { GeneratedBatch } from '../domain/batch-engine'
+import type { ScoringBank, ScoringPolicy } from '../domain/scoring'
 import { activeExamCycle, createCycleLifecycle, isCycleLifecycle, transitionCycleLifecycle } from '../domain/cycle-lifecycle'
 import type { CycleLifecycle } from '../domain/cycle-lifecycle'
 import { isCandidateAnswerFor, readDisplayResponse, responseState, toCandidateAnswer } from '../features/exam/question-response'
@@ -17,6 +18,11 @@ export interface FoundationSource {
   readonly contentNotice?: string
   readonly examDurationMinutes?: number
   readonly timerWarningMinutes?: readonly number[]
+  readonly scoring?: {
+    readonly policy: ScoringPolicy
+    /** This hook is called only on the verified durable submission boundary. */
+    readonly loadBank: () => Promise<ScoringBank>
+  }
   /** Optional complete eligibility universe from a separately verified inventory. */
   readonly eligibleSourceIds?: readonly string[]
 }
@@ -74,8 +80,21 @@ function withCursor(attempt: ExamAttempt, view: CandidateSnapshot['candidateView
 
 /** The guarded numeric position is authoritative. The optional human-readable
  * cursor is derived from it, never trusted to resolve into a submitted section. */
-export function restoreCandidateCursor(attempt: CandidateSnapshot): CandidateSnapshot {
-  return withCursor(restoreAttemptFinalization(attempt), attempt.candidateView === 'review' ? 'review' : 'question')
+export function isTerminalAttempt(attempt: Pick<ExamAttempt, 'status'> | null | undefined) {
+  return attempt?.status === 'SUBMITTED' || attempt?.status === 'SCORED'
+}
+
+export function restoreCandidateCursor(attempt: CandidateSnapshot, source?: FoundationSource): CandidateSnapshot {
+  const restored = isTerminalAttempt(attempt) ? restoreAttemptFinalization(attempt, source?.batch.interactionKinds) : attempt
+  return withCursor(restored, attempt.candidateView === 'review' ? 'review' : 'question')
+}
+
+/** Build the single pending score revision only from a validated terminal row.
+ * The domain rejects an unrelated snapshot, policy, or result. */
+export function recordCandidateScore(attempt: CandidateSnapshot, result: ScoredExamResult, at: number): CandidateSnapshot | null {
+  if (attempt.status !== 'SUBMITTED' || attempt.result !== null) return null
+  const transition = transitionAttempt(attempt, { type: 'RECORD_RESULT', result, at })
+  return transition.ok && transition.attempt.status === 'SCORED' ? withCursor(transition.attempt, 'question') : null
 }
 
 export function initialCandidate(source: FoundationSource, at: number): { attempt: CandidateSnapshot; cycle: CandidateCycle } {
@@ -88,7 +107,7 @@ export function initialCandidate(source: FoundationSource, at: number): { attemp
   if (!generated.ok) throw new TypeError('The examination batch could not be validated.')
   return {
     attempt: withCursor(createAttempt({
-      id: source.attemptId, cycleId: plan.cycleId, batch: plan, optionOrder: plan.optionOrder, at,
+      id: source.attemptId, cycleId: plan.cycleId, batch: plan, optionOrder: plan.optionOrder, interactionKinds: plan.interactionKinds, at,
     }), 'question'),
     cycle: { id: plan.cycleId, contentVersion: plan.contentVersion, lifecycle: generated.state },
   }
@@ -113,13 +132,13 @@ export function candidateQuestion(source: FoundationSource, id: string): Foundat
 
 export function candidateValidators(source: FoundationSource) {
   const { batch, attemptId } = source
-  const expected = createAttempt({ id: attemptId, cycleId: batch.cycleId, batch, optionOrder: batch.optionOrder })
+  const expected = createAttempt({ id: attemptId, cycleId: batch.cycleId, batch, optionOrder: batch.optionOrder, interactionKinds: batch.interactionKinds })
   return {
     validateAttempt(attempt: CandidateSnapshot) {
       if (!isAttemptSnapshot(attempt) || attempt.id !== attemptId || attempt.cycleId !== batch.cycleId
         || !same(attempt.batch, expected.batch) || !same(attempt.optionOrder, expected.optionOrder)
-        || attempt.status === 'SCORED' || attempt.result !== null
-        || (attempt.status === 'SUBMITTED') !== (attempt.submittedAt !== null)
+        || (attempt.interactionKinds !== undefined && !same(attempt.interactionKinds, expected.interactionKinds))
+        || isTerminalAttempt(attempt) !== (attempt.submittedAt !== null)
         || (attempt.candidateView !== 'question' && attempt.candidateView !== 'review')
         || (attempt.candidateView === 'review' && attempt.activeSection === null)) return false
       return Object.entries(attempt.answers).every(([id, answer]) =>
@@ -133,17 +152,17 @@ export function candidateValidators(source: FoundationSource) {
     },
     validatePair(attempt: CandidateSnapshot, cycle: CandidateCycle) {
       const status = attempt.status === 'CREATED' || attempt.status === 'READY' ? 'GENERATED'
-        : attempt.status === 'SUBMITTED' ? 'COMPLETED' : 'STARTED'
+        : isTerminalAttempt(attempt) ? 'COMPLETED' : 'STARTED'
       return activeExamCycle(cycle.lifecycle).batches.find(({ batch: plan }) => plan.id === batch.id)?.status === status
     },
   }
 }
 
-export type CandidateEdit = Exclude<FoundationAction, { type: 'TAKE_OVER' | 'RETRY_SAVE' | 'DISCARD_UNSAVED' }>
+export type CandidateEdit = Exclude<FoundationAction, { type: 'TAKE_OVER' | 'RETRY_SAVE' | 'DISCARD_UNSAVED' | 'RETRY_SCORING' }>
 export type CandidateChange = { readonly attempt: CandidateSnapshot; readonly cycle: CandidateCycle }
 
 export function isRecoveryAction(action: FoundationAction): action is Exclude<FoundationAction, CandidateEdit> {
-  return action.type === 'TAKE_OVER' || action.type === 'RETRY_SAVE' || action.type === 'DISCARD_UNSAVED'
+  return action.type === 'TAKE_OVER' || action.type === 'RETRY_SAVE' || action.type === 'DISCARD_UNSAVED' || action.type === 'RETRY_SCORING'
 }
 
 /** Snapshot the deliberate action as one CAS. Section lock + next section
@@ -155,7 +174,7 @@ export function candidateChange(
   action: CandidateEdit | { type: 'RESUME_BOUNDARY' | 'TIME_EXPIRED' },
   at: number,
 ): CandidateChange | null {
-  if (previous.status === 'SUBMITTED' || previous.revision >= Number.MAX_SAFE_INTEGER
+  if (isTerminalAttempt(previous) || previous.revision >= Number.MAX_SAFE_INTEGER
     || !Number.isFinite(at) || at < 0) return null
   // Use the actual accepted timestamp, not when IndexedDB eventually commits.
   // The session serializes acceptance and never calls this seam with wall time
@@ -193,6 +212,9 @@ export function candidateChange(
         || !apply({ type: 'START_SECTION', durationMinutes: source.examDurationMinutes }) || !track('START')) return null
       break
     case 'NAVIGATE':
+      // Re-selecting the already displayed question is not a transition.
+      // From Review the same position still legitimately reopens the question.
+      if (view === 'question' && section && action.position === previous.position) return null
       if (!apply({ type: 'NAVIGATE', position: action.position })) return null
       view = 'question'
       break
@@ -239,8 +261,9 @@ export function candidateChange(
       if (!atSubmittedSectionBoundary(previous) || !continueAfterSubmit()) return null
       break
   }
+  const finalized = isTerminalAttempt(attempt) ? restoreAttemptFinalization(attempt, source.batch.interactionKinds) : attempt
   return {
-    attempt: withCursor({ ...attempt, updatedAt: now, revision: previous.revision + 1 }, view),
+    attempt: withCursor({ ...finalized, updatedAt: now, revision: previous.revision + 1 }, view),
     cycle: nextCycle,
   }
 }
@@ -256,6 +279,8 @@ export function candidateExamSummary(source: FoundationSource, attempt: Candidat
     return responseState(interaction, readDisplayResponse(interaction, answer)) === 'ANSWERED'
   }).length
   return {
+    answered,
+    total: source.batch.sourceIds.length,
     unanswered: source.batch.sourceIds.length - answered,
     marked: Object.values(attempt.reviewMarks).filter((mark) => mark === true).length,
   }

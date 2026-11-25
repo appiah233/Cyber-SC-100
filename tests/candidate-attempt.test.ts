@@ -1,17 +1,18 @@
 import { IDBFactory } from 'fake-indexeddb'
 import { describe, expect, it } from 'vitest'
-import type { FoundationAction } from '../src/app/App'
 import { ATTEMPT_ID, previewBatch, previewQuestion } from '../src/data/synthetic-preview'
 import { activeExamCycle } from '../src/domain/cycle-lifecycle'
+import { getPinnedFinalizedAnswerSnapshot } from '../src/domain'
+import { scoreFinalizedSnapshot } from '../src/domain/scoring'
+import { syntheticPracticeBank } from '../src/data/synthetic-practice-scoring'
 import {
-  candidateChange, candidateQuestion, candidateValidators, initialCandidate, restoreCandidateCursor,
+  candidateChange, candidateQuestion, candidateValidators, initialCandidate, recordCandidateScore, restoreCandidateCursor,
 } from '../src/integration/candidate-attempt'
-import type { CandidateCycle, CandidateSnapshot, FoundationSource } from '../src/integration/candidate-attempt'
+import type { CandidateCycle, CandidateEdit as Edit, CandidateSnapshot, FoundationSource } from '../src/integration/candidate-attempt'
 import { createExamRepository } from '../src/storage'
 import type { SavedExam, WriterLease } from '../src/storage'
 
 const source: FoundationSource = { attemptId: ATTEMPT_ID, batch: previewBatch, question: previewQuestion }
-type Edit = Exclude<FoundationAction, { type: 'TAKE_OVER' | 'RETRY_SAVE' | 'DISCARD_UNSAVED' }>
 
 function apply(record: ReturnType<typeof initialCandidate>, action: Edit, at = 20) {
   const next = candidateChange(record.attempt, record.cycle, source, action, at)
@@ -76,6 +77,7 @@ describe('Phase 5 candidate command and storage boundary', () => {
     expect(validator.validateAttempt({ ...stored, activeSection: 'STANDARD_BLOCK' })).toBe(false)
     expect(validator.validateAttempt({ ...stored, optionOrder: {} })).toBe(false)
     expect(candidateChange(next.attempt, next.cycle, source, { type: 'NAVIGATE', position: Infinity }, 20)).toBeNull()
+    expect(candidateChange(next.attempt, next.cycle, source, { type: 'NAVIGATE', position: 2 }, 20)).toBeNull()
     const question = apply(review, { type: 'NAVIGATE', position: 2 })
     expect(question.attempt.candidateView).toBe('question')
   })
@@ -170,5 +172,55 @@ describe('Phase 6 candidate finalization', () => {
     expect(candidateChange(end.attempt, end.cycle, timed, { type: 'TIME_EXPIRED' }, 70_000)).toBeNull()
     const tie = candidateChange(typed.attempt, typed.cycle, timed, { type: 'END_EXAM' }, 60_200)!
     expect(tie.attempt.finalizationReason).toBe('TIME_EXPIRED')
+  })
+})
+
+
+describe('Phase 7 candidate result storage boundary', () => {
+  it('migrates a durable legacy terminal snapshot and records one fenced result without changing the cycle', async () => {
+    const indexedDB = new IDBFactory()
+    const repo = createExamRepository<CandidateSnapshot, CandidateCycle>({
+      indexedDB, ...candidateValidators(source), now: () => 100,
+    })
+    const inserted = initialCandidate(source, 10)
+    const lease = await repo.initialize({ ...inserted, contentVersion: previewBatch.contentVersion, writerId: 'writer' })
+    const start = apply(inserted, { type: 'START' })
+    await repo.save({ attempt: start.attempt, expectedRevision: 0, lease, cycleUpdate: { cycle: start.cycle, expectedRevision: 0 } })
+    expect(getPinnedFinalizedAnswerSnapshot(start.attempt)).toBeNull()
+    const terminal = apply(start, { type: 'END_EXAM' }, 25)
+    const pinned = getPinnedFinalizedAnswerSnapshot(terminal.attempt)
+    if (!pinned) throw new Error('Expected pinned final')
+    // Store the shape actually emitted by Phase 6, with no guesses about
+    // interaction provenance in the legacy row.
+    const { attemptId, cycleId, batchId, contentVersion, questionIds, submittedAt, reason, answers } = pinned
+    const legacy = {
+      ...terminal.attempt, interactionKinds: undefined,
+      finalizedAnswerSnapshot: { attemptId, cycleId, batchId, contentVersion, questionIds, submittedAt, reason, answers },
+    }
+    await repo.save({ attempt: legacy, expectedRevision: 1, lease, cycleUpdate: { cycle: terminal.cycle, expectedRevision: 1 } })
+    const saved = await repo.load(ATTEMPT_ID)
+    if (!saved) throw new Error('Missing candidate')
+    expect(getPinnedFinalizedAnswerSnapshot(saved.attempt)).toBeNull()
+    const migrated = restoreCandidateCursor(saved.attempt, source)
+    const snapshot = getPinnedFinalizedAnswerSnapshot(migrated)
+    if (!snapshot) throw new Error('Expected normalized final')
+    const computed = scoreFinalizedSnapshot(snapshot, syntheticPracticeBank, {
+      scoringVersion: 'scoring-test-v1', postExamReviewPolicy: 'NONE', passingPercentage: 75,
+    })
+    if (!computed.ok) throw new Error(computed.reason)
+    expect(computed.result.unansweredCount).toBe(59)
+    expect(recordCandidateScore(start.attempt, computed.result, 100)).toBeNull()
+    expect(recordCandidateScore(migrated, { ...computed.result, snapshotId: 'wrong-attempt' }, 100)).toBeNull()
+    const scored = recordCandidateScore(migrated, computed.result, 100)
+    if (!scored) throw new Error('Expected scoring revision')
+    await repo.save({ attempt: scored, expectedRevision: saved.attempt.revision, lease })
+    await expect(repo.save({ attempt: scored, expectedRevision: saved.attempt.revision, lease }))
+      .rejects.toHaveProperty('code', 'STALE_REVISION')
+    const retained = await repo.load(ATTEMPT_ID)
+    expect(retained?.attempt.result).toEqual(computed.result)
+    expect(retained?.attempt.revision).toBe(saved.attempt.revision + 1)
+    expect(retained?.cycleRevision).toBe(saved.cycleRevision)
+    expect(retained?.attempt.status && recordCandidateScore(retained.attempt, computed.result, 100)).toBeNull()
+    repo.close()
   })
 })

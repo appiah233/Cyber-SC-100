@@ -1,15 +1,16 @@
-import { Component, useEffect, useRef, useState } from 'react'
+import { Component, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import App from '../app/App'
 import type { FoundationAction, FoundationPreview } from '../app/App'
-import { crossedExamWarning, examExpirationAt, examSectionKey, getRemainingTimeMs } from '../domain'
+import { crossedExamWarning, examExpirationAt, examSectionKey, getPinnedFinalizedAnswerSnapshot, getRemainingTimeMs, isScoredExamResult } from '../domain'
+import type { ScoredExamResult } from '../domain'
 import { readDisplayResponse } from '../features/exam/question-response'
 import { createExamRepository, StorageError } from '../storage'
 import type { SavedExam, WriterLease } from '../storage'
 import { ATTEMPT_ID, previewBatch, previewContext, previewQuestion, sectionTitles } from '../data/synthetic-preview'
 import {
   atIntermediateBoundary, candidateChange, candidateExamSummary, candidateQuestion, candidateSection, candidateValidators,
-  initialCandidate, isRecoveryAction, restoreCandidateCursor,
+  initialCandidate, isRecoveryAction, isTerminalAttempt, recordCandidateScore, restoreCandidateCursor,
 } from './candidate-attempt'
 import type { CandidateChange, CandidateCycle, CandidateEdit, CandidateSnapshot, FoundationSource } from './candidate-attempt'
 import { LEASE_MS, tabWriter } from './tab-writer'
@@ -32,6 +33,8 @@ type ViewState = {
   hasUnsavedChange?: boolean
   canRetrySave?: boolean
   finalizing?: boolean
+  scoringError?: boolean
+  canRetryScoring?: boolean
 }
 
 const opening: ViewState = { attempt: null, status: 'Opening browser storage…', readOnly: true }
@@ -86,6 +89,10 @@ function CandidateSession({ source }: { source: FoundationSource }) {
     let announcement: string | undefined
     let lastExpiryAttempt = -Infinity
     let draining = false
+    let scoring = false
+    let scoreGeneration = 0
+    let scoreFailed = false
+    let cachedScore: ScoredExamResult | undefined
     let tail: Promise<unknown> = Promise.resolve()
     const queue = (job: () => Promise<void>) => {
       tail = tail.catch(() => undefined).then(async () => { if (!stopped) await job() })
@@ -98,7 +105,8 @@ function CandidateSession({ source }: { source: FoundationSource }) {
       && edits[0].baseCycleRevision === saved.cycleRevision)
     const show = (status: string, notice?: string, take = false) => {
       if (stopped) return
-      const freezing = finalizing() && saved?.attempt.status !== 'SUBMITTED'
+      const freezing = finalizing() && !isTerminalAttempt(saved?.attempt)
+      const transitioning = edits.some(edit => !edit.optimistic)
       // Do not reveal navigation, section locks, or a submission before its
       // durable transaction has committed. Draft response values are controlled.
       const optimistic = !freezing && lease && baseMatches()
@@ -106,15 +114,17 @@ function CandidateSession({ source }: { source: FoundationSource }) {
       setState({
         attempt: optimistic ?? saved?.attempt ?? null,
         status, notice, error: blocked, finalizing: freezing,
-        readOnly: !lease || failed || Boolean(blocked) || freezing,
-        takeover: !freezing && take,
+        readOnly: !lease || failed || Boolean(blocked) || freezing || transitioning || isTerminalAttempt(saved?.attempt),
+        takeover: !freezing && take && !isTerminalAttempt(saved?.attempt),
+        scoringError: scoreFailed,
+        canRetryScoring: Boolean(scoreFailed && !scoring && source.scoring && saved?.attempt.status === 'SUBMITTED'),
         hasUnsavedChange: failed && !freezing && edits.length > 0,
         canRetrySave: edits.length > 0 && Boolean(lease) && baseMatches() && !freezing,
       })
     }
     const updateTimer = (at: number) => {
       const remainingMs = getRemainingTimeMs(expiresAt(), at)
-      if (stopped || remainingMs === null || saved?.attempt.status === 'SUBMITTED') {
+      if (stopped || remainingMs === null || isTerminalAttempt(saved?.attempt)) {
         if (!stopped) setTimer(undefined)
         return
       }
@@ -132,12 +142,12 @@ function CandidateSession({ source }: { source: FoundationSource }) {
       ? 'This examination is locked while this tab retries submission. Keep this page open.'
       : dueAt !== null ? 'Time has expired. Your examination is being submitted.' : undefined)
     const reconcile = (record: SavedExam<CandidateSnapshot, CandidateCycle> | null) => {
-      saved = record ? { ...record, attempt: restoreCandidateCursor(record.attempt) } : null
+      saved = record ? { ...record, attempt: restoreCandidateCursor(record.attempt, source) } : null
       if (edits.length && !baseMatches()) {
         // A different fenced writer won. Never write these stale answers over
         // a newer section or revision, and never pretend the stale edit saved.
         conflict = true
-        if (saved?.attempt.status === 'SUBMITTED' || finalizing()) {
+        if (isTerminalAttempt(saved?.attempt) || finalizing()) {
           edits.length = 0
           failed = false
         }
@@ -145,7 +155,7 @@ function CandidateSession({ source }: { source: FoundationSource }) {
     }
     const observeExpiry = (at: number) => {
       const current = projected()?.attempt
-      if (!saved || saved.attempt.status === 'SUBMITTED' || !current) return false
+      if (!saved || isTerminalAttempt(saved.attempt) || !current) return false
       if (dueAt === null && current.status !== 'SUBMITTED'
         && typeof current.expiresAt === 'number' && at >= current.expiresAt) {
         dueAt = at
@@ -154,7 +164,8 @@ function CandidateSession({ source }: { source: FoundationSource }) {
       return dueAt !== null
     }
     const showPassive = () => {
-      if (saved?.attempt.status === 'SUBMITTED') {
+      if (isTerminalAttempt(saved?.attempt)) {
+        if (source.scoring && saved?.attempt.status === 'SUBMITTED') { scoreStatus(); requestScoring(); return }
         show('Saved on this device', conflict
           ? 'Another tab finalized this attempt. An unsaved change in this tab could not be added.' : undefined)
         return
@@ -229,6 +240,131 @@ function CandidateSession({ source }: { source: FoundationSource }) {
         sameExpired ? { takeover: true, expectedToken: record.lease!.token } : undefined))
     }
 
+    const scoreStatus = () => {
+      if (scoreFailed) show('Result not available yet', 'Your submitted answers are still locked and saved. Retry scoring to continue.')
+      else show('Scoring examination…')
+    }
+    const canScore = () => Boolean(source.scoring && saved?.attempt.status === 'SUBMITTED' && saved.attempt.result === null)
+    const finishScoreFailure = () => {
+      scoring = false
+      if (!canScore()) return
+      scoreFailed = true
+      scoreStatus()
+    }
+    const recoverScoring = async (error: unknown) => {
+      scoring = false
+      scoreGeneration += 1
+      if (error instanceof StorageError
+        && ['WRITER_ACTIVE', 'TAKEOVER_REQUIRED', 'LEASE_LOST', 'STALE_REVISION', 'CYCLE_CONFLICT'].includes(error.code)) {
+        lease = null
+        try {
+          reconcile(await repo.load(attemptId, version))
+          if (saved?.attempt.status === 'SCORED') {
+            cachedScore = undefined
+            scoreFailed = false
+            show('Saved on this device')
+            return
+          }
+          if (canScore()) { scoreStatus(); return }
+        } catch { /* Keep the durable submission locked and give a retry path. */ }
+      }
+      finishScoreFailure()
+    }
+
+    async function acquireScoringBasis() {
+      if (!identity || !source.scoring) return null
+      // Always re-read to settle stale/follower races before requesting an
+      // answer bank. The local candidate projection is never a score input.
+      const latest = await repo.load(attemptId, version)
+      if (!latest) throw new StorageError('NOT_FOUND')
+      reconcile(latest)
+      if (!canScore()) { show('Saved on this device'); return null }
+      const currentTime = Date.now()
+      if (latest.lease && latest.lease.writerId !== identity.id && latest.lease.expiresAt > currentTime) {
+        lease = null
+        return null
+      }
+      const expiredWriter = latest.lease && latest.lease.expiresAt <= currentTime
+      if (!latest.lease || expiredWriter || lease?.token !== latest.lease.token || lease.writerId !== identity.id) {
+        await attachWriter(await repo.acquireWriter(attemptId, identity.id,
+          expiredWriter ? { takeover: true, expectedToken: latest.lease!.token } : undefined))
+      } else lease = latest.lease
+      if (!canScore() || !saved || !lease) return null
+      const snapshot = getPinnedFinalizedAnswerSnapshot(saved.attempt)
+      if (!snapshot) throw new StorageError('CORRUPT')
+      return { snapshot, revision: saved.attempt.revision, lease }
+    }
+
+    async function persistScore(result: ScoredExamResult) {
+      try {
+        const basis = await acquireScoringBasis()
+        if (!basis || !saved) { scoring = false; return }
+        if (basis.snapshot.snapshotId !== result.snapshotId) {
+          cachedScore = undefined
+          finishScoreFailure()
+          return
+        }
+        const after = recordCandidateScore(saved.attempt, result, Date.now())
+        if (!after) { finishScoreFailure(); return }
+        const durable = await repo.save({ attempt: after, expectedRevision: basis.revision, lease: basis.lease })
+        saved = { ...saved, attempt: restoreCandidateCursor(durable, source), lease: basis.lease }
+        cachedScore = undefined
+        scoreFailed = false
+        scoring = false
+        show('Saved on this device')
+      } catch (error) {
+        // Store failure never reopens the exam. Keep only the derived aggregate
+        // for a retry with the exact saved snapshot; no answer definitions.
+        await recoverScoring(error)
+      }
+    }
+
+    function requestScoring(retry = false) {
+      if (stopped || blocked || !source.scoring || !canScore() || scoring || (scoreFailed && !retry)) return
+      scoring = true
+      scoreFailed = false
+      scoreStatus()
+      const config = source.scoring
+      const run = ++scoreGeneration
+      queue(async () => {
+        try {
+          const basis = await acquireScoringBasis()
+          if (!basis) { scoring = false; return }
+          const retryResult = cachedScore
+          if (retryResult && retryResult.snapshotId === basis.snapshot.snapshotId) {
+            await persistScore(retryResult)
+            return
+          }
+          cachedScore = undefined
+          // Keep the loader outside the save queue so the active writer's
+          // lease can keep renewing while the verified bank becomes available.
+          // Never attach the answer bank to UI state, logs or IndexedDB.
+          void (async () => {
+            const [bank, scorer] = await Promise.all([config.loadBank(), import('../domain/scoring')])
+            if (stopped || run !== scoreGeneration) return
+            queue(async () => {
+              if (run !== scoreGeneration) return
+              try {
+                // A suspended former owner may have missed its lease renewal.
+                // Recheck ownership and identical pinned inputs BEFORE computing.
+                const current = await acquireScoringBasis()
+                if (!current) { scoring = false; return }
+                if (current.snapshot.snapshotId !== basis.snapshot.snapshotId) { finishScoreFailure(); return }
+                const normalized = scorer.scoreFinalizedSnapshot(current.snapshot, bank, config.policy)
+                if (!normalized.ok) { finishScoreFailure(); return }
+                cachedScore = normalized.result
+                await persistScore(normalized.result)
+              } catch (error) {
+                await recoverScoring(error)
+              }
+            })
+          })().catch(() => queue(async () => { if (run === scoreGeneration) finishScoreFailure() }))
+        } catch (error) {
+          await recoverScoring(error)
+        }
+      })
+    }
+
     const accept = (action: CandidateEdit | { type: 'TIME_EXPIRED' | 'RESUME_BOUNDARY' }, at: number) => {
       const base = projected()
       if (!saved || !base || !baseMatches()) return false
@@ -248,12 +384,12 @@ function CandidateSession({ source }: { source: FoundationSource }) {
     }
 
     const acquireForExpiry = async () => {
-      if (!identity || !saved || saved.attempt.status === 'SUBMITTED') return false
+      if (!identity || !saved || isTerminalAttempt(saved.attempt)) return false
       if (lease && lease.expiresAt > Date.now()) return true
       const latest = await repo.load(attemptId, version)
       if (!latest) throw new StorageError('NOT_FOUND')
       reconcile(latest)
-      if (latest.attempt.status === 'SUBMITTED') { showPassive(); return false }
+      if (isTerminalAttempt(latest.attempt)) { showPassive(); return false }
       if (latest.lease && latest.lease.expiresAt > Date.now() && latest.lease.writerId !== identity.id) return false
       const expiredLease = latest.lease && latest.lease.expiresAt <= Date.now()
       await attachWriter(await repo.acquireWriter(attemptId, identity.id,
@@ -265,7 +401,7 @@ function CandidateSession({ source }: { source: FoundationSource }) {
       if (!saved || (blocked && blocked !== renderError)) return
       observeExpiry(Date.now())
       if ((blocked || displayFailed.current) && !finalizing()) return
-      if (saved.attempt.status === 'SUBMITTED') { showPassive(); return }
+      if (isTerminalAttempt(saved.attempt)) { showPassive(); return }
       if (finalizing()) {
         try {
           if (!(await acquireForExpiry())) return
@@ -300,7 +436,7 @@ function CandidateSession({ source }: { source: FoundationSource }) {
             ...(cycleChanged ? { cycleUpdate: { cycle: change.cycle, expectedRevision: durable.cycleRevision } } : {}),
           })
           const cycleRevision = durable.cycleRevision + (cycleChanged ? 1 : 0)
-          saved = { ...durable, attempt: restoreCandidateCursor(attempt), cycle: change.cycle, cycleRevision, lease }
+          saved = { ...durable, attempt: restoreCandidateCursor(attempt, source), cycle: change.cycle, cycleRevision, lease }
           edits.splice(0, count)
           failed = false
           if (attempt.status === 'SUBMITTED') {
@@ -309,6 +445,7 @@ function CandidateSession({ source }: { source: FoundationSource }) {
             show('Saved on this device', conflict
               ? 'An unsaved change from the previous editing session could not be added.' : undefined)
             updateTimer(Date.now())
+            requestScoring()
             return
           }
           const observedAt = Date.now()
@@ -356,6 +493,7 @@ function CandidateSession({ source }: { source: FoundationSource }) {
     }
 
     const ready = async () => {
+      if (isTerminalAttempt(saved?.attempt)) { showPassive(); return }
       if (observeExpiry(Date.now()) || finalizing()) { await drain(); return }
       if (edits.length) {
         if (!failed && baseMatches()) await drain()
@@ -377,9 +515,14 @@ function CandidateSession({ source }: { source: FoundationSource }) {
         const record = await repo.load(attemptId, version)
         if (stopped) return
         reconcile(record)
+        if (record?.attempt.status === 'SCORED' || (record?.attempt.status === 'SUBMITTED' && !source.scoring)) {
+          showPassive()
+          return
+        }
         identity = await tabWriter()
         if (stopped) { identity.release(); return }
         if (record) {
+          if (record.attempt.status === 'SUBMITTED') { showPassive(); return }
           if (observeExpiry(Date.now())) { await drain(); return }
           await resumeEditor(record)
         } else {
@@ -399,6 +542,11 @@ function CandidateSession({ source }: { source: FoundationSource }) {
 
     dispatchRef.current = (action) => {
       if (displayFailed.current || blocked) return
+      if (action.type === 'RETRY_SCORING') {
+        if (scoreFailed) requestScoring(true)
+        return
+      }
+      if (isTerminalAttempt(saved?.attempt)) return
       const at = Date.now()
       if (observeExpiry(at) || finalizing()) { requestDrain(); return }
       if (!isRecoveryAction(action)) {
@@ -446,6 +594,17 @@ function CandidateSession({ source }: { source: FoundationSource }) {
     const refresh = async (renew: boolean) => {
       if (!identity || blocked || displayFailed.current) return
       try {
+        if (saved?.attempt.status === 'SCORED') return
+        if (saved?.attempt.status === 'SUBMITTED') {
+          if (!source.scoring) return
+          // Pending bank load still yields to a regular lease heartbeat.
+          if (renew && lease && lease.expiresAt > Date.now()) {
+            try { lease = await repo.acquireWriter(attemptId, identity.id) }
+            catch (error) { await recoverScoring(error) }
+          }
+          if (!scoring) requestScoring()
+          return
+        }
         if (observeExpiry(Date.now()) || finalizing()) { await drain(); return }
         if (lease) {
           if (renew) {
@@ -461,7 +620,7 @@ function CandidateSession({ source }: { source: FoundationSource }) {
         const latest = await repo.load(attemptId, version)
         if (!latest) throw new StorageError('NOT_FOUND')
         reconcile(latest)
-        if (!observeExpiry(Date.now()) && latest.attempt.status !== 'SUBMITTED'
+        if (!observeExpiry(Date.now()) && !isTerminalAttempt(latest.attempt)
           && latest.lease?.writerId === identity.id) {
           await resumeEditor(latest)
           await ready()
@@ -514,10 +673,14 @@ function CandidateSession({ source }: { source: FoundationSource }) {
   const active = attempt ? candidateSection(attempt) : undefined
   const section = active ?? source.batch.sections[attempt?.locks.length ?? 0]
   const sectionId = section ? examSectionKey(section) : ''
-  const complete = attempt?.status === 'SUBMITTED'
+  const complete = isTerminalAttempt(attempt)
+  const scoredSnapshot = attempt?.status === 'SCORED' ? getPinnedFinalizedAnswerSnapshot(attempt) : null
+  const result = attempt && scoredSnapshot && isScoredExamResult(attempt.result, scoredSnapshot) ? attempt.result : undefined
+  const scoringView = Boolean(source.scoring && attempt?.status === 'SUBMITTED')
   const final = attempt?.status === 'FINAL_SUBMISSION_PENDING'
     || Boolean(attempt && atIntermediateBoundary(attempt) && attempt.locks.length === attempt.batch.sections.length)
-  let view: NonNullable<FoundationPreview['view']> = state.error ? 'error' : complete ? 'complete'
+  let view: NonNullable<FoundationPreview['view']> = state.error ? 'error'
+    : result ? 'results' : scoringView ? 'scoring' : complete ? 'complete'
     : final ? 'final' : !hasStarted ? 'intro' : !active ? 'intro'
     : attempt?.candidateView === 'review' ? 'review' : 'question'
   if (hasStarted && !active && view === 'intro') view = 'error'
@@ -563,6 +726,10 @@ function CandidateSession({ source }: { source: FoundationSource }) {
     timer,
     finalizing: state.finalizing,
     finalizationReason: attempt?.finalizationReason ?? undefined,
+    canScore: Boolean(source.scoring),
+    result,
+    scoringError: state.scoringError,
+    canRetryScoring: state.canRetryScoring,
     status: { label: state.status, tone: state.error ? 'error' : state.notice ? 'warning' : 'neutral' },
     readOnly: state.readOnly || view === 'error',
     notice: state.notice,
@@ -614,6 +781,11 @@ function CandidateSession({ source }: { source: FoundationSource }) {
   )
 }
 
-export function Foundation({ source = syntheticSource }: { readonly source?: FoundationSource } = {}) {
-  return <CandidateSession key={JSON.stringify([source.idbName, source.attemptId, source.batch.contentVersion])} source={source} />
+export function Foundation({ source, defaultScoring }: {
+  readonly source?: FoundationSource
+  readonly defaultScoring?: FoundationSource['scoring']
+} = {}) {
+  const configuration = useMemo(() => source ?? (defaultScoring && syntheticSource.batch.contentVersion === 'synthetic-preview-v3'
+    ? { ...syntheticSource, scoring: defaultScoring } : syntheticSource), [source, defaultScoring])
+  return <CandidateSession key={JSON.stringify([configuration.idbName, configuration.attemptId, configuration.batch.contentVersion])} source={configuration} />
 }

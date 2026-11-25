@@ -2,6 +2,8 @@ import { Component, useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Button, ConfirmDialog, Panel, Progress, Select, Status } from '../design-system/primitives'
 import { QuestionRenderer } from '../features/exam/QuestionRenderer'
+import { Results } from './Results'
+import type { ScoredExamResult } from '../domain/model'
 import { ExhibitViewer } from '../features/exam/ExhibitViewer'
 import { responseState } from '../features/exam/question-response'
 import type { DisplayInteraction, DisplayResponse } from '../features/exam/QuestionRenderer'
@@ -47,7 +49,7 @@ export interface FoundationPreview {
   readonly position: number
   readonly answers?: Readonly<Record<string, DisplayResponse>>
   readonly marks?: readonly string[]
-  readonly view?: 'intro' | 'question' | 'review' | 'final' | 'complete' | 'error'
+  readonly view?: 'intro' | 'question' | 'review' | 'final' | 'complete' | 'scoring' | 'results' | 'error'
   readonly context?: FoundationContext
   readonly examTitle?: string
   readonly synthetic?: boolean
@@ -62,12 +64,16 @@ export interface FoundationPreview {
   readonly timer?: { readonly remainingMs: number; readonly announcement?: string; readonly expired?: boolean }
   readonly finalizationReason?: 'MANUAL_SUBMISSION' | 'TIME_EXPIRED'
   readonly finalizing?: boolean
-  readonly examSummary?: { readonly unanswered: number; readonly marked: number }
+  readonly examSummary?: { readonly total?: number; readonly answered?: number; readonly unanswered: number; readonly marked: number }
+  readonly canScore?: boolean
+  readonly scoringError?: boolean
+  readonly canRetryScoring?: boolean
+  readonly result?: ScoredExamResult
 }
 
 export type FoundationAction =
   | { readonly type: 'START' }
-  | { readonly type: 'TAKE_OVER' | 'RETRY_SAVE' | 'DISCARD_UNSAVED' }
+  | { readonly type: 'TAKE_OVER' | 'RETRY_SAVE' | 'DISCARD_UNSAVED' | 'RETRY_SCORING' }
   | { readonly type: 'NAVIGATE'; readonly position: number; readonly sectionId?: string }
   | { readonly type: 'ANSWER'; readonly questionId: string; readonly response: DisplayResponse }
   | { readonly type: 'TOGGLE_MARK'; readonly questionId: string }
@@ -217,7 +223,10 @@ export default function App({ preview, onAction }: {
   const total = data.sections.reduce((count, section) => count + section.count, 0)
   const question = data.questions[data.position]
   const requestedView = data.view ?? (data.error ? 'error' : 'question')
-  const view = ((requestedView === 'intro' && total <= 0) || (requestedView === 'question' && !question) ||
+  const terminalResultView = requestedView === 'scoring' || requestedView === 'results'
+  const view = ((terminalResultView && (!data.sections.length || data.sections.some(({ state }) => state !== 'locked'))) ||
+      (requestedView === 'results' && (!data.result || data.result.questionCount !== total)) ||
+      (requestedView === 'intro' && total <= 0) || (requestedView === 'question' && !question) ||
       ((requestedView === 'question' || requestedView === 'review') &&
         (!active || active.state !== 'current' || active.count <= 0 || active.count !== data.questions.length)))
     ? 'error' : requestedView
@@ -238,9 +247,17 @@ export default function App({ preview, onAction }: {
   const canCommit = Boolean(preview && onAction && !actionsDisabled && !data.hasUnsavedChange)
   const showLifecycle = (isWorking || view === 'final') && Boolean(preview && onAction)
   const displayTime = data.timer ? timerText(data.timer.remainingMs) : undefined
-  const finalUnanswered = data.examSummary?.unanswered ?? unansweredCount
+  const finalTotal = data.examSummary?.total ?? total
+  const finalUnanswered = data.examSummary?.unanswered ?? Math.max(0, finalTotal - answeredCount)
+  const finalAnswered = data.examSummary?.answered ?? Math.max(0, finalTotal - finalUnanswered)
   const finalMarked = data.examSummary?.marked ?? markedCount
-  const endDescription = `This locks every section and saves your final responses. Unanswered or incomplete: ${finalUnanswered}. Marked for review: ${finalMarked}.${displayTime ? ' Time remaining: ' + displayTime + '.' : ''}`
+  const configuredFinalDialog = dialog === 'final' && data.canScore === true
+  const endDescription = data.canScore
+    ? 'After submission, all sections are locked and you cannot change your answers. This examination will be scored.'
+    : 'This locks every section and saves your final responses.'
+  const canRetryScoring = Boolean(
+    view === 'scoring' && data.scoringError && onAction && (data.canRetryScoring ?? !data.readOnly),
+  )
   const isCase = caseSection(active)
   const isInteractive = sectionKind(active) === 'FINAL_INTERACTIVE_BLOCK'
   const finishLabel = isCase ? 'Finish case study' : isInteractive ? 'Finish interactive section' : 'Finish section'
@@ -282,6 +299,10 @@ export default function App({ preview, onAction }: {
   }, [viewKey])
 
   const act = (action: FoundationAction) => {
+    if (action.type === 'RETRY_SCORING') {
+      if (canRetryScoring) onAction?.(action)
+      return
+    }
     if (actionsDisabled && !['TAKE_OVER', 'RETRY_SAVE', 'DISCARD_UNSAVED'].includes(action.type)) return
     if (onAction) { onAction(action); return }
     setSample((previous) => {
@@ -564,6 +585,22 @@ export default function App({ preview, onAction }: {
           </Panel>
         )}
 
+        {view === 'scoring' && (
+          <Panel className="surface review complete-panel" label="Result status">
+            <p className="eyebrow">Submission recorded</p>
+            <h1 ref={headingRef} tabIndex={-1}>{data.scoringError ? 'Results unavailable' : 'Preparing your results'}</h1>
+            <p role={data.scoringError ? 'alert' : 'status'}>{data.scoringError
+              ? 'Your examination has been submitted and your responses are locked. Scoring could not be completed.'
+              : 'Your examination is locked. Results will appear here once they are ready.'}</p>
+            {data.scoringError && <div className="scoring-recovery" role="group" aria-label="Results recovery">
+              {canRetryScoring && <Button tone="primary" onClick={() => act({ type: 'RETRY_SCORING' })}>Retry scoring</Button>}
+              <Button onClick={() => window.location.reload()}>Reload exam results</Button>
+            </div>}
+          </Panel>
+        )}
+
+        {view === 'results' && data.result && <Results result={data.result} labels={labels} headingRef={headingRef} />}
+
         {view === 'error' && (
           <Panel className="surface review complete-panel" label="Examination recovery">
             <p className="eyebrow">Unable to continue</p>
@@ -581,12 +618,20 @@ export default function App({ preview, onAction }: {
       </main>
       <ConfirmDialog
         open={dialog !== null && canCommit}
-        title={dialog === 'end' ? 'End this exam?' : dialog === 'final' ? 'Submit this exam?' : isCase ? 'Finish this case study?' : isInteractive ? 'Finish this interactive section?' : 'Finish this section?'}
+        title={dialog === 'end' || configuredFinalDialog ? 'End this exam?' : dialog === 'final' ? 'Submit this exam?' : isCase ? 'Finish this case study?' : isInteractive ? 'Finish this interactive section?' : 'Finish this section?'}
         description={dialog === 'final' || dialog === 'end'
           ? endDescription
           : `${unansweredCount > 0 ? `You have ${unansweredCount} unanswered or incomplete ${unansweredCount === 1 ? 'question' : 'questions'}. ` : ''}After you submit this ${isCase ? 'case study' : 'section'}, you cannot return to ${sectionCount === 1 ? 'this question or change your answer' : 'these questions or change your answers'}.`}
-        confirmLabel={dialog === 'end' ? 'End and submit' : dialog === 'final' ? 'Submit exam' : isCase ? 'Submit case study' : 'Submit section'}
-        cancelLabel={dialog === 'end' ? 'Return to exam' : dialog === 'final' || isCase ? 'Go back' : 'Return to review'}
+        summary={(dialog === 'end' || dialog === 'final') && (
+          <dl className="end-summary">
+            {([
+              ['Total questions', finalTotal], ['Answered', finalAnswered], ['Unanswered or incomplete', finalUnanswered],
+              ['Marked for review', finalMarked], ['Time remaining', displayTime ?? 'Not timed'],
+            ] as const).map(([label, value]) => <div key={label}><dt>{label}:</dt>{' '}<dd>{value}</dd></div>)}
+          </dl>
+        )}
+        confirmLabel={dialog === 'end' || configuredFinalDialog ? 'End and submit' : dialog === 'final' ? 'Submit exam' : isCase ? 'Submit case study' : 'Submit section'}
+        cancelLabel={dialog === 'end' || configuredFinalDialog ? 'Return to exam' : dialog === 'final' || isCase ? 'Go back' : 'Return to review'}
         onCancel={dismiss}
         onConfirm={() => {
           setDialog(null)
