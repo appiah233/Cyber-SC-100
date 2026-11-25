@@ -1,3 +1,3 @@
-# Static question-bank projection (boundary only)
+# Protected question-bank compiler
 
-Use separately versioned application metadata and a distinct future production projection. A projection must default to ineligible, require independent source/interaction/content eligibility, and exclude private review data and development fixtures. The public repository and CI use only synthetic contracts and UI previews. No real source content or answer bank is generated in Phase 2.
+Use the [Phase 3 runbook](../../docs/PHASE-3-PROTECTED-BANK.md) for offline build, source-answer verification and the private reviewer. The compiler is outside the application entry graph. Private artifacts are separate from public synthetic CI and not eligible for production.

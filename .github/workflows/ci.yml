@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - 'phase-2/**'
+      - 'phase-3/**'
       - 'feature/**'
   pull_request:
     branches:
@@ -52,6 +53,10 @@ jobs:
 
       - name: Unit and integration tests
         run: npm test
+
+      # This public lane uses synthetic records only. Real source and review data stay private.
+      - name: Verify source-answer integrity with synthetic fixtures
+        run: npm run test:bank
 
       - name: Build static output
         run: npm run build

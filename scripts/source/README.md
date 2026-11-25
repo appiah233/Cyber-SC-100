@@ -1,3 +1,3 @@
-# Private source lane (boundary only)
+# Protected source pipeline
 
-This public directory documents a private future process; it holds no PDF, source pages, original question records, answer maps or real reference fixture. Perform any extraction in an authorized workspace outside this checkout. Validate the original document digest, retain stable IDs and source locators, separate immutable source records from reviewed overlays, and keep answer and asset checks private. Do not place these materials in public Git, a GitHub Actions input or artifact, a Vite import, or `public/`. Phase 2 does not implement extraction.
+Use the [Phase 3 protected pipeline runbook](../../docs/PHASE-3-PROTECTED-BANK.md) for pinned PDF extraction, placement inventory, and individual crop repair. Never place real inputs or generated content inside a public Git checkout or Vite build. No runtime source extraction.

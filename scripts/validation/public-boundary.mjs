@@ -13,10 +13,11 @@ const distAsset = /^assets\/[\w.-]+\.(?:js|css|svg)$/i;
 const firstPartyIcon = /^(?:favicon|exam-icon)\.svg$/i;
 
 // A denylist only catches known mistakes. Do not put private materials in the checkout.
-const privatePath = /(?:^|\/)(?:\.env(?:\.[^/]*)?|[^/]*\.(?:pdf|map|zip|tgz|tar|pem|pfx|p12|key)|private(?:[-_.][^/]*)?|reference[-_]batch[-_]\d+(?:\.[^/]*)?|answer[-_]keys?(?:\.[^/]*)?|id_rsa(?:\.pub)?|id_ed25519(?:\.pub)?)($|\/)/i;
+const privatePath = /(?:^|\/)(?:\.env(?:\.[^/]*)?|[^/]*\.(?:pdf|map|zip|tgz|tar|pem|pfx|p12|key|pyc)|\.?private(?:[-_.][^/]*)?|reference[-_]batch[-_]\d+(?:\.[^/]*)?|answer[-_]keys?(?:\.[^/]*)?|scoring[-_]bank\.json|review[-_]outputs?|sc100-x\d+-[a-f0-9]{16}\.png|sc100-q\d{3}-p\d{3}-exhibit-\d{2}-(?:crop-)?[a-f0-9]{16}\.png|id_rsa(?:\.pub)?|id_ed25519(?:\.pub)?)($|\/)/i;
 const materialMarkers = [
   /(?:^|\b)%PDF-\d|data:application\/pdf|\bJVBERi0[A-Za-z0-9+/]{12,}/i,
   /["'](?:rawAnswer(?:Text|Block)?|rawExplanation|sourceAnswer|sourcePdfSha256)["']\s*:\s*["'][^"'\r\n]+/i,
+  /["'](?:rawAnswerBlock|rawExplanationLayout|rawQuestionAreaLayout)["']\s*:\s*\[\s*["'][^"'\r\n]+/i,
   /-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----/,
   /\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|AKIA[A-Z0-9]{16}|xox[baprs]-[A-Za-z0-9-]{20,})\b/,
 ];
@@ -26,9 +27,11 @@ const bundledOnlyMarkers = [
   /(?:\/\/|\/\*)[#@]\s*sourceMappingURL\s*=/,
   /\b(?:private[-_](?:source[-_]?map|answer[-_]?key)|raw[-_]source[-_]pdf)\b/i,
 ];
+const privateJsonScope = /"scope"\s*:\s*"PRIVATE_DEVELOPMENT_ONLY"/;
+const privateReviewHtml = /<title>\s*Private source review\s*<\/title>/i;
 const unsafeSvg = /<\s*(?:script|foreignobject|iframe|object|embed)\b|\bon\w+\s*=|(?:xlink:)?href\s*=\s*["']\s*(?!#)[^"']+/i;
 const unsafeApplicationSink = /\bdangerouslySetInnerHTML\b|\.innerHTML\s*=|\.outerHTML\s*=|\.insertAdjacentHTML\s*\(|\bdocument\.write\s*\(/;
-const rootText = /\.(?:m?[jt]sx?|css|json|md|html|ya?ml|toml|txt|svg|xml)$/i;
+const rootText = /\.(?:m?[jt]sx?|css|json|md|html?|ya?ml|toml|txt|svg|xml|py)$/i;
 
 async function walk(dir, prefix, skipRootDirectories, records) {
   for (const entry of await readdir(dir, { withFileTypes: true })) {
@@ -114,6 +117,10 @@ export async function inspectPublicBoundary(directory, mode) {
     if (mode === 'source' && !rootText.test(relative)) continue;
     const content = raw.toString('utf8');
     if (materialMarkers.some(pattern => pattern.test(content))) issues.push('restricted-content-marker');
+    if ((/\.json$/i.test(relative) && privateJsonScope.test(content)) ||
+        (/\.html?$/i.test(relative) && privateReviewHtml.test(content))) {
+      issues.push('restricted-private-projection');
+    }
     if (mode === 'source' && relative.startsWith('src/') && /\.[jt]sx?$/.test(relative) && unsafeApplicationSink.test(content)) issues.push('unsafe-application-markup-sink');
     if (mode === 'dist' && bundledOnlyMarkers.some(pattern => pattern.test(content))) issues.push('restricted-bundle-marker');
     if (/\.svg$/i.test(relative) && unsafeSvg.test(content)) issues.push('unsafe-svg-content');

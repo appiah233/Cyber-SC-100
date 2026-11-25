@@ -92,3 +92,38 @@ test('rejects unsafe application markup sinks and external styles', () => withDi
   });
   assert.deepEqual((await inspectPublicBoundary(dir, 'dist')).issues, ['unapproved-or-missing-resource']);
 }));
+
+test('rejects private checkout directories and extracted record data in pipeline source', () => withDirectory(async dir => {
+  await write(dir, {
+    '.private/notes.txt': 'synthetic marker only',
+    'scripts/source/pipeline.py': 'example = ' + JSON.stringify({ [['Raw', 'AnswerBlock'].join('')]: ['synthetic review canary'] }),
+    'scripts/source/__pycache__/pipeline.pyc': 'not a retained binary',
+  });
+  assert.deepEqual((await inspectPublicBoundary(dir, 'source')).issues, [
+    'restricted-content-marker', 'restricted-file-path', 'unsupported-file-or-directory',
+  ]);
+}));
+
+test('rejects renamed private projections and viewer output without reading them into logs', () => withDirectory(async dir => {
+  await write(dir, {
+    'src/data/mislabeled.json': JSON.stringify({ scope: 'PRIVATE_DEVELOPMENT_ONLY', questions: [] }),
+    'docs/mislabeled.htm': '<title>Private source review</title><p>Synthetic marker.</p>',
+    'src/data/scoring-bank.json': '{}',
+  });
+  assert.deepEqual((await inspectPublicBoundary(dir, 'source')).issues, [
+    'restricted-file-path', 'restricted-private-projection', 'restricted-private-projection',
+  ]);
+}));
+
+test('keeps generated source-crop and review-output naming lanes out of public source', () => withDirectory(async dir => {
+  await write(dir, {
+    'public/assets/sc100-x0000-aaaaaaaaaaaaaaaa.png': 'synthetic absent PNG bytes',
+    'src/data/sc100-q000-p000-exhibit-00-crop-bbbbbbbbbbbbbbbb.png': 'synthetic marker only',
+    'assets/sc100-q000-p000-exhibit-00-cccccccccccccccc.png': 'synthetic preview naming',
+    'review-output/innocuous.txt': 'synthetic marker only',
+    'scripts/question-bank/review.mjs': 'export const safe = true;',
+  });
+  assert.deepEqual((await inspectPublicBoundary(dir, 'source')).issues, [
+    'restricted-file-path', 'restricted-file-path', 'restricted-file-path', 'unsupported-file-or-directory',
+  ]);
+}));
