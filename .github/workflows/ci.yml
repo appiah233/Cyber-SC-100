@@ -10,6 +10,7 @@ on:
       - 'phase-5/**'
       - 'phase-6/**'
       - 'phase-7/**'
+      - 'release/**'
       - 'remediation/**'
       - 'feature/**'
   pull_request:

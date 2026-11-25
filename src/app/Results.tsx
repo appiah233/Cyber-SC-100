@@ -1,5 +1,5 @@
 import { useId } from 'react'
-import type { Ref } from 'react'
+import type { ReactNode, Ref } from 'react'
 import type { ScoredExamResult } from '../domain/model'
 import './results.css'
 
@@ -51,10 +51,11 @@ function Breakdown({ title, rows }: {
 
 /** Receives only persisted, aggregate result data. It has no source payload,
  * scoring rules, or mutable response state. */
-export function Results({ result, labels, headingRef }: {
+export function Results({ result, labels, headingRef, continuation }: {
   readonly result: ScoredExamResult
   readonly labels: ReadonlyMap<string, string>
   readonly headingRef: Ref<HTMLHeadingElement>
+  readonly continuation?: ReactNode
 }) {
   const passed = result.outcome === 'PASS'
   const timedOut = result.finalizationReason === 'TIME_EXPIRED'
@@ -92,6 +93,7 @@ export function Results({ result, labels, headingRef }: {
         }))} />
       </div>
       <p className="results-locked">This examination is locked. Detailed answer review is not available here.</p>
+      {continuation}
     </section>
   )
 }

@@ -13,6 +13,8 @@ import {
   initialCandidate, isRecoveryAction, isTerminalAttempt, recordCandidateScore, restoreCandidateCursor,
 } from './candidate-attempt'
 import type { CandidateChange, CandidateCycle, CandidateEdit, CandidateSnapshot, FoundationSource } from './candidate-attempt'
+import { canAdvanceCandidate, candidateCycleSummary } from './candidate-journey'
+import type { JourneyAdvance } from './candidate-journey'
 import { LEASE_MS, tabWriter } from './tab-writer'
 
 export type { FoundationSource } from './candidate-attempt'
@@ -35,6 +37,7 @@ type ViewState = {
   finalizing?: boolean
   scoringError?: boolean
   canRetryScoring?: boolean
+  cycle?: FoundationPreview['cycle']
 }
 
 const opening: ViewState = { attempt: null, status: 'Opening browser storage…', readOnly: true }
@@ -93,6 +96,7 @@ function CandidateSession({ source }: { source: FoundationSource }) {
     let scoreGeneration = 0
     let scoreFailed = false
     let cachedScore: ScoredExamResult | undefined
+    let moving = false
     let tail: Promise<unknown> = Promise.resolve()
     const queue = (job: () => Promise<void>) => {
       tail = tail.catch(() => undefined).then(async () => { if (!stopped) await job() })
@@ -111,7 +115,16 @@ function CandidateSession({ source }: { source: FoundationSource }) {
       // durable transaction has committed. Draft response values are controlled.
       const optimistic = !freezing && lease && baseMatches()
         ? edits.findLast((edit) => edit.optimistic)?.change.attempt : undefined
+      const mayAdvance = saved && source.journey && source.eligibleSourceIds
+        && canAdvanceCandidate(saved.attempt, Boolean(source.scoring))
+      const cycle = mayAdvance ? {
+        ...candidateCycleSummary(saved!, source.eligibleSourceIds!),
+        canContinue: !blocked && Boolean(identity && (!saved!.lease || saved!.lease.writerId === identity.id
+          || saved!.lease.expiresAt <= Date.now())),
+        advancing: moving,
+      } : undefined
       setState({
+        cycle,
         attempt: optimistic ?? saved?.attempt ?? null,
         status, notice, error: blocked, finalizing: freezing,
         readOnly: !lease || failed || Boolean(blocked) || freezing || transitioning || isTerminalAttempt(saved?.attempt),
@@ -365,6 +378,49 @@ function CandidateSession({ source }: { source: FoundationSource }) {
       })
     }
 
+    function requestAdvance(action: JourneyAdvance) {
+      if (moving || blocked || !source.journey || !saved || !identity
+        || !canAdvanceCandidate(saved.attempt, Boolean(source.scoring))) return
+      moving = true
+      show('Preparing examination…')
+      const journey = source.journey
+      const worker = identity
+      queue(async () => {
+        try {
+          const current = await repo.load(attemptId, version)
+          if (!current) throw new StorageError('CORRUPT')
+          reconcile(current)
+          if (!canAdvanceCandidate(current.attempt, Boolean(source.scoring))) throw new StorageError('CYCLE_CONFLICT')
+          const at = Date.now()
+          const expired = current.lease && current.lease.expiresAt <= at
+          if (current.lease && current.lease.writerId !== worker.id && !expired) throw new StorageError('WRITER_ACTIVE')
+          const granted = await repo.acquireWriter(attemptId, worker.id,
+            expired ? { takeover: true, expectedToken: current.lease!.token } : undefined)
+          await attachWriter(granted)
+          if (!saved || !lease) throw new StorageError('LEASE_LOST')
+          const prior = saved
+          const next = journey.advance(prior, action, at)
+          await repo.advanceJourney({
+            journeyId: journey.id, attemptId,
+            expectedRevision: prior.attempt.revision, expectedCycleRevision: prior.cycleRevision, lease,
+            next, validateNext: candidateValidators(next.source),
+            canAdvance: (attempt) => canAdvanceCandidate(attempt, Boolean(source.scoring)),
+          })
+          // New attempt and journey pointer are already committed together.
+          // Re-resolve the pointer even if this tab closes before remounting.
+          lease = null
+          journey.onAdvanced()
+        } catch (error) {
+          moving = false
+          if (error instanceof StorageError && error.code === 'STALE_REVISION') journey.onStale()
+          const notice = error instanceof StorageError && error.code === 'WRITER_ACTIVE'
+            ? 'Use the editing tab to continue this cycle.'
+            : 'The next examination was not opened. Your saved result was preserved. Try again or reload.'
+          show('Could not continue the cycle', notice)
+        }
+      })
+    }
+
     const accept = (action: CandidateEdit | { type: 'TIME_EXPIRED' | 'RESUME_BOUNDARY' }, at: number) => {
       const base = projected()
       if (!saved || !base || !baseMatches()) return false
@@ -512,23 +568,23 @@ function CandidateSession({ source }: { source: FoundationSource }) {
 
     queue(async () => {
       try {
-        const record = await repo.load(attemptId, version)
+        const record = source.journey ? await repo.loadJourney(source.journey.id, version) : await repo.load(attemptId, version)
         if (stopped) return
         reconcile(record)
-        if (record?.attempt.status === 'SCORED' || (record?.attempt.status === 'SUBMITTED' && !source.scoring)) {
+        if (!source.journey && (record?.attempt.status === 'SCORED' || (record?.attempt.status === 'SUBMITTED' && !source.scoring))) {
           showPassive()
           return
         }
         identity = await tabWriter()
         if (stopped) { identity.release(); return }
         if (record) {
-          if (record.attempt.status === 'SUBMITTED') { showPassive(); return }
+          if (isTerminalAttempt(record.attempt)) { showPassive(); return }
           if (observeExpiry(Date.now())) { await drain(); return }
           await resumeEditor(record)
         } else {
           try {
             const initial = initialCandidate(source, Date.now())
-            await attachWriter(await repo.initialize({ ...initial, contentVersion: version, writerId: identity.id }))
+            await attachWriter(await repo.initialize({ ...initial, contentVersion: version, writerId: identity.id, journeyId: source.journey?.id }))
           } catch (error) {
             if (!(error instanceof StorageError) || error.code !== 'ALREADY_EXISTS') throw error
             await attachWriter(await repo.acquireWriter(attemptId, identity.id))
@@ -542,6 +598,10 @@ function CandidateSession({ source }: { source: FoundationSource }) {
 
     dispatchRef.current = (action) => {
       if (displayFailed.current || blocked) return
+      if (action.type === 'NEXT_EXAM' || action.type === 'START_NEW_CYCLE') {
+        requestAdvance(action.type)
+        return
+      }
       if (action.type === 'RETRY_SCORING') {
         if (scoreFailed) requestScoring(true)
         return
@@ -594,7 +654,10 @@ function CandidateSession({ source }: { source: FoundationSource }) {
     const refresh = async (renew: boolean) => {
       if (!identity || blocked || displayFailed.current) return
       try {
-        if (saved?.attempt.status === 'SCORED') return
+        if (saved?.attempt.status === 'SCORED' || (saved?.attempt.status === 'SUBMITTED' && !source.scoring)) {
+          if (source.journey && !moving) showPassive()
+          return
+        }
         if (saved?.attempt.status === 'SUBMITTED') {
           if (!source.scoring) return
           // Pending bank load still yields to a regular lease heartbeat.
@@ -729,6 +792,8 @@ function CandidateSession({ source }: { source: FoundationSource }) {
     canScore: Boolean(source.scoring),
     result,
     scoringError: state.scoringError,
+    cycle: state.cycle,
+    focusOnMount: source.focusOnMount,
     canRetryScoring: state.canRetryScoring,
     status: { label: state.status, tone: state.error ? 'error' : state.notice ? 'warning' : 'neutral' },
     readOnly: state.readOnly || view === 'error',

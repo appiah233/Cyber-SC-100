@@ -14,7 +14,7 @@
     "verify:private-reference": "node scripts/check-private-reference.mjs",
     "build:bank": "node scripts/question-bank/cli.mjs build",
     "verify:source-answers": "node scripts/question-bank/cli.mjs verify",
-    "test:bank": "node --test tests/bank.test.mjs tests/review-bank.test.mjs tests/local-score-projection.test.mjs",
+    "test:bank": "node --test tests/bank.test.mjs tests/review-bank.test.mjs tests/local-score-projection.test.mjs scripts/question-bank/release-bank.test.mjs",
     "review:bank": "node scripts/question-bank/review.mjs"
   },
   "type": "module",

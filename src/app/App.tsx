@@ -2,6 +2,8 @@ import { Component, useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Button, ConfirmDialog, Panel, Progress, Select, Status } from '../design-system/primitives'
 import { QuestionRenderer } from '../features/exam/QuestionRenderer'
+import { CycleContinuation } from './CycleContinuation'
+import type { CycleContinuationState } from './CycleContinuation'
 import { Results } from './Results'
 import type { ScoredExamResult } from '../domain/model'
 import { ExhibitViewer } from '../features/exam/ExhibitViewer'
@@ -49,7 +51,7 @@ export interface FoundationPreview {
   readonly position: number
   readonly answers?: Readonly<Record<string, DisplayResponse>>
   readonly marks?: readonly string[]
-  readonly view?: 'intro' | 'question' | 'review' | 'final' | 'complete' | 'scoring' | 'results' | 'error'
+  readonly view?: 'loading' | 'intro' | 'question' | 'review' | 'final' | 'complete' | 'scoring' | 'results' | 'error'
   readonly context?: FoundationContext
   readonly examTitle?: string
   readonly synthetic?: boolean
@@ -69,11 +71,14 @@ export interface FoundationPreview {
   readonly scoringError?: boolean
   readonly canRetryScoring?: boolean
   readonly result?: ScoredExamResult
+  readonly cycle?: CycleContinuationState
+  readonly focusOnMount?: boolean
 }
 
 export type FoundationAction =
   | { readonly type: 'START' }
   | { readonly type: 'TAKE_OVER' | 'RETRY_SAVE' | 'DISCARD_UNSAVED' | 'RETRY_SCORING' }
+  | { readonly type: 'NEXT_EXAM' | 'START_NEW_CYCLE' }
   | { readonly type: 'NAVIGATE'; readonly position: number; readonly sectionId?: string }
   | { readonly type: 'ANSWER'; readonly questionId: string; readonly response: DisplayResponse }
   | { readonly type: 'TOGGLE_MARK'; readonly questionId: string }
@@ -193,7 +198,7 @@ export default function App({ preview, onAction }: {
   onAction?: (action: FoundationAction) => void
 }) {
   const [sample, setSample] = useState(standalone)
-  const [dialog, setDialog] = useState<'section' | 'end' | 'final' | null>(null)
+  const [dialog, setDialog] = useState<'section' | 'end' | 'final' | 'new-cycle' | null>(null)
   const [filter, setFilter] = useState<ReviewFilter>('all')
   const [navFilter, setNavFilter] = useState<ReviewFilter>('all')
   const [navigatorOpen, setNavigatorOpen] = useState(() => matchesWidth(wideWorkspace))
@@ -231,6 +236,11 @@ export default function App({ preview, onAction }: {
         (!active || active.state !== 'current' || active.count <= 0 || active.count !== data.questions.length)))
     ? 'error' : requestedView
   const isWorking = view === 'question' || view === 'review'
+  const cycle = (view === 'results' || view === 'complete') &&
+    data.sections.length > 0 && data.sections.every(({ state }) => state === 'locked') ? data.cycle : undefined
+  const canAdvanceCycle = Boolean(cycle?.canContinue && !cycle.advancing && onAction)
+  const canStartNewCycle = canAdvanceCycle && cycle?.status === 'COMPLETE'
+  const canStartNextExam = canAdvanceCycle && cycle?.status === 'ACTIVE' && cycle.availableQuestions > 0
   const markSet = new Set(data.marks ?? [])
   const questionStates = isWorking ? data.questions.map((item, position) => ({
     item, position, state: answerState(item, data.answers?.[item.id]), marked: markSet.has(item.id),
@@ -276,7 +286,7 @@ export default function App({ preview, onAction }: {
     if (data.activeSectionId !== scope.section) setContextOpen(matchesWidth(wideCasePane))
     if (dialog !== null) setDialog(null)
   }
-  if (dialog !== null && !canCommit) setDialog(null)
+  if (dialog !== null && !(dialog === 'new-cycle' ? canStartNewCycle : canCommit)) setDialog(null)
 
   useEffect(() => {
     if (typeof matchMedia !== 'function') return
@@ -294,11 +304,16 @@ export default function App({ preview, onAction }: {
 
   const viewKey = JSON.stringify([data.activeSectionId, data.position, view])
   useEffect(() => {
-    if (previousViewKey.current !== null && previousViewKey.current !== viewKey) headingRef.current?.focus()
+    if ((previousViewKey.current === null && data.focusOnMount && view === 'intro') ||
+      (previousViewKey.current !== null && previousViewKey.current !== viewKey)) headingRef.current?.focus()
     previousViewKey.current = viewKey
-  }, [viewKey])
+  }, [data.focusOnMount, view, viewKey])
 
   const act = (action: FoundationAction) => {
+    if (action.type === 'NEXT_EXAM' || action.type === 'START_NEW_CYCLE') {
+      if (action.type === 'NEXT_EXAM' ? canStartNextExam : canStartNewCycle) onAction?.(action)
+      return
+    }
     if (action.type === 'RETRY_SCORING') {
       if (canRetryScoring) onAction?.(action)
       return
@@ -333,6 +348,15 @@ export default function App({ preview, onAction }: {
       else headingRef.current?.focus()
     })
   }
+  const continuation = cycle && (
+    <CycleContinuation state={{ ...cycle, canContinue: Boolean(onAction) && cycle.canContinue }}
+      onNextExam={() => act({ type: 'NEXT_EXAM' })}
+      onNewCycle={(trigger) => {
+        if (!canStartNewCycle) return
+        dialogTrigger.current = trigger
+        setDialog('new-cycle')
+      }} />
+  )
   const sections = (
     <ol className="stepper" role="list" aria-label="Exam sections">
       {data.sections.map((section, index) => (
@@ -408,6 +432,14 @@ export default function App({ preview, onAction }: {
               </div>
             )}
           </div>
+        )}
+
+        {view === 'loading' && (
+          <Panel className="surface review complete-panel" label="Examination loading">
+            <p className="eyebrow">Examination Hub</p>
+            <h1 ref={headingRef} tabIndex={-1}>Opening examination</h1>
+            <p>Checking whether there is a saved examination on this device.</p>
+          </Panel>
         )}
 
         {view === 'intro' && (
@@ -582,6 +614,7 @@ export default function App({ preview, onAction }: {
             <p className="eyebrow"><span aria-hidden="true">✓ </span>Submission recorded</p>
             <h1 ref={headingRef} tabIndex={-1}>Exam submitted</h1>
             <p>{data.finalizationReason === 'TIME_EXPIRED' ? 'Time expired. Your examination was submitted automatically and responses are locked.' : 'The examination has been submitted. Your responses are no longer editable.'}</p>
+            {continuation}
           </Panel>
         )}
 
@@ -599,7 +632,9 @@ export default function App({ preview, onAction }: {
           </Panel>
         )}
 
-        {view === 'results' && data.result && <Results result={data.result} labels={labels} headingRef={headingRef} />}
+        {view === 'results' && data.result && <Results
+          result={data.result} labels={labels} headingRef={headingRef} continuation={continuation}
+        />}
 
         {view === 'error' && (
           <Panel className="surface review complete-panel" label="Examination recovery">
@@ -617,10 +652,10 @@ export default function App({ preview, onAction }: {
         <footer className="page-footer">Examination Hub <span aria-hidden="true">·</span> Candidate examination</footer>
       </main>
       <ConfirmDialog
-        open={dialog !== null && canCommit}
-        title={dialog === 'end' || configuredFinalDialog ? 'End this exam?' : dialog === 'final' ? 'Submit this exam?' : isCase ? 'Finish this case study?' : isInteractive ? 'Finish this interactive section?' : 'Finish this section?'}
-        description={dialog === 'final' || dialog === 'end'
-          ? endDescription
+        open={dialog !== null && (dialog === 'new-cycle' ? canStartNewCycle : canCommit)}
+        title={dialog === 'new-cycle' ? 'Start a new cycle?' : dialog === 'end' || configuredFinalDialog ? 'End this exam?' : dialog === 'final' ? 'Submit this exam?' : isCase ? 'Finish this case study?' : isInteractive ? 'Finish this interactive section?' : 'Finish this section?'}
+        description={dialog === 'new-cycle' ? 'This starts another pass through the eligible question bank. Questions from this completed cycle may appear again in the new one.'
+          : dialog === 'final' || dialog === 'end' ? endDescription
           : `${unansweredCount > 0 ? `You have ${unansweredCount} unanswered or incomplete ${unansweredCount === 1 ? 'question' : 'questions'}. ` : ''}After you submit this ${isCase ? 'case study' : 'section'}, you cannot return to ${sectionCount === 1 ? 'this question or change your answer' : 'these questions or change your answers'}.`}
         summary={(dialog === 'end' || dialog === 'final') && (
           <dl className="end-summary">
@@ -630,11 +665,15 @@ export default function App({ preview, onAction }: {
             ] as const).map(([label, value]) => <div key={label}><dt>{label}:</dt>{' '}<dd>{value}</dd></div>)}
           </dl>
         )}
-        confirmLabel={dialog === 'end' || configuredFinalDialog ? 'End and submit' : dialog === 'final' ? 'Submit exam' : isCase ? 'Submit case study' : 'Submit section'}
-        cancelLabel={dialog === 'end' || configuredFinalDialog ? 'Return to exam' : dialog === 'final' || isCase ? 'Go back' : 'Return to review'}
+        confirmLabel={dialog === 'new-cycle' ? 'Start new cycle' : dialog === 'end' || configuredFinalDialog ? 'End and submit' : dialog === 'final' ? 'Submit exam' : isCase ? 'Submit case study' : 'Submit section'}
+        cancelLabel={dialog === 'new-cycle' ? 'Keep result' : dialog === 'end' || configuredFinalDialog ? 'Return to exam' : dialog === 'final' || isCase ? 'Go back' : 'Return to review'}
         onCancel={dismiss}
         onConfirm={() => {
           setDialog(null)
+          if (dialog === 'new-cycle') {
+            act({ type: 'START_NEW_CYCLE' })
+            return
+          }
           if (!canCommit) return
           if (dialog === 'final' && view === 'final') act({ type: 'FINAL_SUBMIT' })
           else if (dialog === 'end' && isWorking) act({ type: 'END_EXAM' })

@@ -13,7 +13,7 @@ const distAsset = /^assets\/[\w.-]+\.(?:js|css|svg)$/i;
 const firstPartyIcon = /^(?:favicon|exam-icon)\.svg$/i;
 
 // A denylist only catches known mistakes. Do not put private materials in the checkout.
-const privatePath = /(?:^|\/)(?:\.env(?:\.[^/]*)?|[^/]*\.(?:pdf|map|zip|tgz|tar|pem|pfx|p12|key|pyc)|\.?private(?:[-_.][^/]*)?|reference[-_]batch[-_]\d+(?:\.[^/]*)?|answer[-_]keys?(?:\.[^/]*)?|scoring[-_]bank\.json|candidate[-_]scoring\.[cm]?js|review[-_]outputs?|sc100-x\d+-[a-f0-9]{16}\.png|sc100-q\d{3}-p\d{3}-exhibit-\d{2}-(?:crop-)?[a-f0-9]{16}\.png|id_rsa(?:\.pub)?|id_ed25519(?:\.pub)?)($|\/)/i;
+const privatePath = /(?:^|\/)(?:\.env(?:\.[^/]*)?|[^/]*\.(?:pdf|map|zip|tgz|tar|pem|pfx|p12|key|pyc)|\.?private(?:[-_.][^/]*)?|reference[-_]batch[-_]\d+(?:\.[^/]*)?|answer[-_]keys?(?:\.[^/]*)?|scoring[-_]bank\.json|candidate[-_]scoring\.[cm]?js|release[-_](?:audit|bank|manifest|scoring)\.json|review[-_]outputs?|sc100-x\d+-[a-f0-9]{16}\.png|sc100-q\d{3}-p\d{3}-exhibit-\d{2}-(?:crop-)?[a-f0-9]{16}\.png|id_rsa(?:\.pub)?|id_ed25519(?:\.pub)?)($|\/)/i;
 const materialMarkers = [
   /(?:^|\b)%PDF-\d|data:application\/pdf|\bJVBERi0[A-Za-z0-9+/]{12,}/i,
   /["'](?:rawAnswer(?:Text|Block)?|rawExplanation|sourceAnswer|sourcePdfSha256)["']\s*:\s*["'][^"'\r\n]+/i,
@@ -23,15 +23,17 @@ const materialMarkers = [
 ];
 const bundledOnlyMarkers = [
   /\bcandidate[-_]scoring\.[cm]?js\b/i,
+  /\brelease[-_](?:audit|bank|manifest|scoring)\.json\b/i,
   /\bREFERENCE[-_]BATCH[-_]\d+\b/i,
   /\b(?:PRIVATE_DEVELOPMENT_ONLY|PRIVATE_EXAM_CONTENT_CANARY|PRIVATE_EXAM_SCORING_CANARY)\b/,
-  /\bvirtual:local-candidate-display\b/,
+  /\bPRIVATE_RELEASE_CANDIDATE(?:_(?:AUDIT|MANIFEST|SCORING))?_ONLY\b/,
+  /\bvirtual:local-(?:candidate|release)-display\b/,
   /(?:\/\/|\/\*)[#@]\s*sourceMappingURL\s*=/,
   /\b(?:private[-_](?:source[-_]?map|answer[-_]?key)|raw[-_]source[-_]pdf)\b/i,
 ];
-const privateJsonScope = /"scope"\s*:\s*"PRIVATE_DEVELOPMENT_ONLY"/;
+const privateJsonScope = /"scope"\s*:\s*"(?:PRIVATE_DEVELOPMENT_ONLY|PRIVATE_RELEASE_CANDIDATE(?:_(?:AUDIT|MANIFEST|SCORING))?_ONLY)"/;
 const privateReviewHtml = /<title>\s*Private source review\s*<\/title>/i;
-const localCandidateEvidence = /(?:^|\/)phase[-_]?5[-_]evidence(?:\/|$)/i;
+const localCandidateEvidence = /(?:^|\/)(?:phase[-_]?\d+|release(?:[-_]candidate)?|final[-_]release)[-_]evidence(?:\/|$)/i;
 const unsafeSvg = /<\s*(?:script|foreignobject|iframe|object|embed)\b|\bon\w+\s*=|(?:xlink:)?href\s*=\s*["']\s*(?!#)[^"']+/i;
 const unsafeApplicationSink = /\bdangerouslySetInnerHTML\b|\.innerHTML\s*=|\.outerHTML\s*=|\.insertAdjacentHTML\s*\(|\bdocument\.write\s*\(/;
 const rootText = /\.(?:m?[jt]sx?|css|json|md|html?|ya?ml|toml|txt|svg|xml|py)$/i;
