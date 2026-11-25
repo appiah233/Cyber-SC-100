@@ -1,0 +1,129 @@
+import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import test from 'node:test';
+import { inspectPublicBoundary } from './public-boundary.mjs';
+
+async function withDirectory(run) {
+  const dir = await mkdtemp(join(tmpdir(), 'exam-boundary-'));
+  try {
+    await run(dir);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function write(dir, files) {
+  for (const [path, text] of Object.entries(files)) {
+    const parts = path.split('/');
+    const file = parts.pop();
+    const parent = join(dir, ...parts);
+    await mkdir(parent, { recursive: true });
+    await writeFile(join(parent, file), text);
+  }
+}
+
+test('accepts intended public source and excludes ordinary generated local output', () => withDirectory(async dir => {
+  await write(dir, {
+    'src/contract.ts': 'export type SourceQuestion = { readonly rawAnswer: string };',
+    'README.md': 'Private reference data must stay outside this checkout.',
+    'dist/placeholder.map': '{}',
+    'node_modules/dependency.js': '',
+  });
+  assert.deepEqual(await inspectPublicBoundary(dir, 'source'), { inspected: 2, issues: [] });
+}));
+
+test('rejects blocked source paths, disguised private content and symlinks', () => withDirectory(async dir => {
+  await write(dir, {
+    'public/sample.pdf': 'not a real PDF',
+    'src/notes.txt': JSON.stringify({ rawAnswer: 'synthetic safety canary' }),
+    'src/hidden.bin': ['%P', 'DF-1.7'].join(''),
+    'src/file.ts': 'export const synthetic = 1;',
+  });
+  await symlink(join(dir, 'src/file.ts'), join(dir, 'public/link.ts'), 'file');
+  assert.deepEqual((await inspectPublicBoundary(dir, 'source')).issues, [
+    'pdf-content', 'restricted-content-marker', 'restricted-file-path', 'unsupported-file-or-directory',
+  ]);
+}));
+
+test('accepts Vite output with entry and assets under the Pages base', () => withDirectory(async dir => {
+  await write(dir, {
+    'index.html': '<link rel="stylesheet" href="/Cyber-SC-100/assets/main.css"><script type="module" src="/Cyber-SC-100/assets/main.js"></script>',
+    'assets/main.js': 'console.log("synthetic shell");',
+    'assets/main.css': 'main { background-image: url("./mark.svg"); }',
+    'assets/mark.svg': '<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0h1"/></svg>',
+  });
+  assert.deepEqual(await inspectPublicBoundary(dir, 'dist'), { inspected: 4, issues: [] });
+}));
+
+test('rejects root-only links, missing files, metadata leaks and source maps', () => withDirectory(async dir => {
+  await write(dir, {
+    'index.html': '<link rel="stylesheet" href="/Cyber-SC-100/assets/missing.css"><script type="module" src="/assets/main.js"></script>',
+    'assets/main.js': "export const sample = '" + ['PRIVATE_EXAM_', 'CONTENT_CANARY'].join('') + "';",
+    'assets/main.js.map': '{}',
+    'notes.txt': 'not an approved output',
+  });
+  assert.deepEqual((await inspectPublicBoundary(dir, 'dist')).issues, [
+    'restricted-bundle-marker', 'restricted-file-path', 'unapproved-dist-file',
+    'unapproved-or-missing-resource', 'unapproved-or-missing-resource',
+  ]);
+}));
+
+test('rejects an inline script claiming to be a Vite module entry', () => withDirectory(async dir => {
+  await write(dir, {
+    'index.html': '<script type="module">console.log("synthetic inline");</script>',
+  });
+  assert.deepEqual((await inspectPublicBoundary(dir, 'dist')).issues, ['inline-script', 'missing-module-entry']);
+}));
+
+test('rejects unsafe application markup sinks and external styles', () => withDirectory(async dir => {
+  await write(dir, {
+    'src/view.ts': 'export function apply(node: Element) { node.innerHTML = ""; }',
+    'docs/design.md': 'Do not use dangerouslySetInnerHTML in the shell.',
+  });
+  assert.deepEqual((await inspectPublicBoundary(dir, 'source')).issues, ['unsafe-application-markup-sink']);
+  await rm(join(dir, 'src'), { recursive: true });
+  await rm(join(dir, 'docs'), { recursive: true });
+  await write(dir, {
+    'index.html': '<script type="module" src="./assets/main.js"></script>',
+    'assets/main.js': '',
+    'assets/main.css': '@import "https://example.invalid/test.css";',
+  });
+  assert.deepEqual((await inspectPublicBoundary(dir, 'dist')).issues, ['unapproved-or-missing-resource']);
+}));
+
+test('rejects private checkout directories and extracted record data in pipeline source', () => withDirectory(async dir => {
+  await write(dir, {
+    '.private/notes.txt': 'synthetic marker only',
+    'scripts/source/pipeline.py': 'example = ' + JSON.stringify({ [['Raw', 'AnswerBlock'].join('')]: ['synthetic review canary'] }),
+    'scripts/source/__pycache__/pipeline.pyc': 'not a retained binary',
+  });
+  assert.deepEqual((await inspectPublicBoundary(dir, 'source')).issues, [
+    'restricted-content-marker', 'restricted-file-path', 'unsupported-file-or-directory',
+  ]);
+}));
+
+test('rejects renamed private projections and viewer output without reading them into logs', () => withDirectory(async dir => {
+  await write(dir, {
+    'src/data/mislabeled.json': JSON.stringify({ scope: 'PRIVATE_DEVELOPMENT_ONLY', questions: [] }),
+    'docs/mislabeled.htm': '<title>Private source review</title><p>Synthetic marker.</p>',
+    'src/data/scoring-bank.json': '{}',
+  });
+  assert.deepEqual((await inspectPublicBoundary(dir, 'source')).issues, [
+    'restricted-file-path', 'restricted-private-projection', 'restricted-private-projection',
+  ]);
+}));
+
+test('keeps generated source-crop and review-output naming lanes out of public source', () => withDirectory(async dir => {
+  await write(dir, {
+    'public/assets/sc100-x0000-aaaaaaaaaaaaaaaa.png': 'synthetic absent PNG bytes',
+    'src/data/sc100-q000-p000-exhibit-00-crop-bbbbbbbbbbbbbbbb.png': 'synthetic marker only',
+    'assets/sc100-q000-p000-exhibit-00-cccccccccccccccc.png': 'synthetic preview naming',
+    'review-output/innocuous.txt': 'synthetic marker only',
+    'scripts/question-bank/review.mjs': 'export const safe = true;',
+  });
+  assert.deepEqual((await inspectPublicBoundary(dir, 'source')).issues, [
+    'restricted-file-path', 'restricted-file-path', 'restricted-file-path', 'unsupported-file-or-directory',
+  ]);
+}));
