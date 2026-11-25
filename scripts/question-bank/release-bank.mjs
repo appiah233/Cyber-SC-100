@@ -3,16 +3,62 @@ import { compileBank, digest, indexSource, verifyBank, verifyOracle } from './ba
 export const RELEASE_SCOPE = 'PRIVATE_RELEASE_CANDIDATE_ONLY'
 export const RELEASE_SCORING_SCOPE = 'PRIVATE_RELEASE_CANDIDATE_SCORING_ONLY'
 const AUDIT_SCOPE = 'PRIVATE_RELEASE_CANDIDATE_AUDIT_ONLY'
-const POLICY_VERSION = 'release-v1-source-gates'
+const POLICY_VERSION = 'release-v2-source-limitations'
 const choiceCounts = { two: 2, three: 3, four: 4, five: 5, six: 6 }
 const interactionKinds = new Set([
   'DROPDOWN_HOTSPOT', 'MATCHING', 'ORDERING', 'DRAG_DROP', 'STATEMENT', 'DIAGRAM_DEPENDENT',
 ])
-const heldAnomalies = Object.freeze({
-  Q6: 'SOURCE_WORDING_DISCREPANCY',
-  Q58: 'ALTERNATIVE_ORDER_SOURCE_AMBIGUITY',
-  Q360: 'SOURCE_INTERACTION_REVIEW_REQUIRED',
+// Exact previous holds, reconciled to the delivered release-readiness report.
+const corrections = Object.freeze({
+  Q6: {
+    page: 7, kind: 'SINGLE_CHOICE', caseStudyId: 'CS-FABRIKAM',
+    code: 'SOURCE_WORDING_DISCREPANCY',
+    limitation: 'The source case scenario and the stem name the same table differently.',
+    impact: 'The candidate sees the original wording discrepancy.',
+    treatment: 'Retain the original scenario, question text, radio options, and printed answer.',
+  },
+  Q58: {
+    page: 58, kind: 'ORDERING', caseStudyId: null,
+    code: 'ALTERNATIVE_ORDER_SOURCE_AMBIGUITY',
+    limitation: 'The prompt says more than one order can be correct; the printed source specifies only one sequence.',
+    impact: 'The original prompt allows alternatives, but the source does not enumerate alternative creditable sequences.',
+    treatment: 'Present the original ordering controls and exact source wording; grade only the printed sequence without inventing equivalents.',
+  },
+  Q209: {
+    page: 207, kind: 'SINGLE_CHOICE', caseStudyId: 'CS-FRONT-DOOR',
+    code: 'REPEATED_SOURCE_PROPOSAL_INTENT',
+    limitation: 'Shares a proposal intent with an earlier source item but is independently identified in the PDF.',
+    impact: 'A candidate may recognize the previously tested proposal intent.',
+    treatment: 'Retain the separate source ID, original stem/options, canonical case context, and printed answer.',
+  },
+  Q211: {
+    page: 209, kind: 'SINGLE_CHOICE', caseStudyId: 'CS-FRONT-DOOR',
+    code: 'REPEATED_SOURCE_PROPOSAL_INTENT',
+    limitation: 'Shares a proposal intent with an earlier source item but is independently identified in the PDF.',
+    impact: 'A candidate may recognize the previously tested proposal intent.',
+    treatment: 'Retain the separate source ID, original stem/options, canonical case context, and printed answer.',
+  },
+  Q360: {
+    page: 358, kind: 'DROPDOWN', caseStudyId: null,
+    code: 'TEXT_EQUIVALENT_OF_SOURCE_DROPDOWN_IMAGE',
+    limitation: 'The static PDF answer-area image cannot itself provide a browser dropdown.',
+    impact: 'The original unselected image remains available; the candidate answers through two equivalent, labeled text dropdowns.',
+    treatment: 'Keep the exact unmodified source raster and both original target/option lists; no coordinate control or scoring geometry.',
+  },
 })
+const reviewedSourceDropdownImage = Object.freeze({
+  sourceQuestionId: 'Q360', sourcePage: 358, sourceXref: 1466,
+  path: 'assets/sc100-x1466-d389f9dbde5466e0.png',
+  checksum: 'd389f9dbde5466e02a501a07dcaaec809ad7855635ed728142a898ac902c1747',
+})
+function sourceDropdownImage(asset) {
+  // The pinned image was visually verified to contain no selected choices or
+  // keyed response and independently OCR-matched all 8 source labels in order.
+  return Object.entries(reviewedSourceDropdownImage).every(([key, value]) => asset?.[key] === value)
+}
+function approvedReleaseAsset(asset) {
+  return Boolean(asset?.path && (asset.reviewStatus === 'VALIDATED_SOURCE_PLACEMENT' || sourceDropdownImage(asset)))
+}
 const noteAnomalies = Object.freeze({
   Q44: 'SOURCE_PLACEHOLDER_TEXT_SUFFICIENT',
   Q113: 'SOURCE_PLACEHOLDER_TEXT_SUFFICIENT',
@@ -26,7 +72,7 @@ function instructionCounts(prompt) {
   return [...new Set(counts.map(([, count]) => choiceCounts[count.toLowerCase()] ?? Number(count)))]
 }
 
-export function reviewReleaseInteraction(interaction, sourceText, mapping) {
+function projectReleaseInteraction(interaction, sourceText, mapping, printedSequenceOnly = false) {
   const groups = []
   const capture = (id, options) => {
     if (!Array.isArray(options) || !options.length) err('RELEASE_OPTION_GROUP_INVALID')
@@ -94,7 +140,7 @@ export function reviewReleaseInteraction(interaction, sourceText, mapping) {
     case 'ORDERING': {
       capture('items', interaction.items)
       if (!/\b(?:in (?:the )?(?:correct |appropriate )?(?:order|sequence)|order should|sequence of|first)\b/i.test(sourceText) ||
-        /\b(?:more than one|any order|multiple orders)\b/i.test(sourceText)) err('RELEASE_ORDERING_INSTRUCTION_REVIEW_REQUIRED')
+        (!printedSequenceOnly && /\b(?:more than one|any order|multiple orders)\b/i.test(sourceText))) err('RELEASE_ORDERING_INSTRUCTION_REVIEW_REQUIRED')
       const selections = requireSelections(interaction.positions.map((position) => ({ ...position, options: interaction.items })))
       const optionIds = interaction.positions.map(({ id }) => selections[id])
       if (new Set(optionIds).size !== optionIds.length) err('RELEASE_ORDERING_MAPPING_MISMATCH')
@@ -110,6 +156,10 @@ export function reviewReleaseInteraction(interaction, sourceText, mapping) {
   return { shown, answer, optionGroups: groups }
 }
 
+export function reviewReleaseInteraction(interaction, sourceText, mapping) {
+  return projectReleaseInteraction(interaction, sourceText, mapping)
+}
+
 export function validReleaseAssetBoundary(proof, expectedCount) {
   return Number.isInteger(expectedCount) && expectedCount >= 0 &&
     proof?.placementsChecked === expectedCount && proof?.crossingAnswerBoundary === 0
@@ -119,27 +169,33 @@ export function validReleaseAssetBoundary(proof, expectedCount) {
  * positive evidence needed for a release-candidate projection. */
 export function reviewReleaseRecord({ question, row, prompt, mapping, answer, family, assetsForQuestion }) {
   const { sourceId, sourcePage, interaction, caseStudyId } = question
-  const knownHold = Object.hasOwn(heldAnomalies, sourceId) ? heldAnomalies[sourceId] : null
+  const correction = Object.hasOwn(corrections, sourceId) ? corrections[sourceId] : undefined
   const note = Object.hasOwn(noteAnomalies, sourceId) ? noteAnomalies[sourceId] : null
-  const heldByFamily = family?.heldChildIds.includes(sourceId) && 'SOURCE_CASE_CHILD_REVIEW_REQUIRED'
+  const heldByFamily = Boolean(family?.heldChildIds.includes(sourceId))
   const excludedByFamily = family?.rejectedChildIds.includes(sourceId)
   const missing = assetsForQuestion.filter(asset => asset.path === null)
-  const approvedAssets = assetsForQuestion.filter(asset => asset.path && asset.reviewStatus === 'VALIDATED_SOURCE_PLACEMENT')
+  const approvedAssets = assetsForQuestion.filter(approvedReleaseAsset)
+  const auditedDropdown = sourceId === 'Q360' && !question.requiresDiagram && assetsForQuestion.length === 1
+    && sourceDropdownImage(assetsForQuestion[0]) && interaction.targets?.length === 2
+    && interaction.targets.every(target => target.options?.length === 3)
+  const verifiedCorrection = Boolean(correction && correction.page === sourcePage && correction.kind === interaction.kind
+    && correction.caseStudyId === caseStudyId && (!caseStudyId || (family?.id === caseStudyId && heldByFamily))
+    && (sourceId !== 'Q360' || auditedDropdown))
   const gates = {
     sourceIdentity: question.sourceValidated && Number.isInteger(sourcePage) && row.SourcePage === sourcePage ? 'PASS' : 'FAIL',
     answerMapping: answer && row.MappingValidated && answer.sourceAnswerDigest === digest(row.RawAnswerBlock) &&
       answer.normalizedMappingDigest === digest(mapping) ? 'PASS' : 'FAIL',
-    interaction: question.interactionValidated && !/^(?:correct answer|explanation)\s*:?[ \t]*$/mi.test(prompt) ? 'PASS' : 'HOLD',
+    interaction: (question.interactionValidated || auditedDropdown) && !/^(?:correct answer|explanation)\s*:?[ \t]*$/mi.test(prompt) ? 'PASS' : 'HOLD',
     asset: question.requiredAssetIds.every(id => approvedAssets.some(asset => asset.assetId === id))
       && (!question.requiresDiagram || question.requiredAssetIds.length > 0)
       && (!missing.length || (note === 'SOURCE_PLACEHOLDER_TEXT_SUFFICIENT' && !question.requiresDiagram)) ? 'PASS' : 'HOLD',
-    caseRelationship: !caseStudyId || (family?.validatedChildIds.includes(sourceId) && !!family.scenarioText) ? 'PASS' : 'HOLD',
-    anomaly: knownHold || heldByFamily ? 'HOLD' : 'PASS',
+    caseRelationship: !caseStudyId || ((family?.validatedChildIds.includes(sourceId) || verifiedCorrection) && !!family?.scenarioText) ? 'PASS' : 'HOLD',
+    anomaly: (correction && !verifiedCorrection) || (heldByFamily && !verifiedCorrection) ? 'HOLD' : 'PASS',
   }
   let projected, interactionHold = null
-  if (gates.interaction === 'PASS' && !knownHold && !heldByFamily && !excludedByFamily) {
+  if (gates.interaction === 'PASS' && gates.anomaly === 'PASS' && !excludedByFamily) {
     try {
-      projected = reviewReleaseInteraction(interaction, prompt, mapping)
+      projected = projectReleaseInteraction(interaction, prompt, mapping, sourceId === 'Q58' && verifiedCorrection)
     } catch (error) {
       if (!(error instanceof Error) || !/^RELEASE_[A-Z_]+$/.test(error.message)) throw error
       interactionHold = error.message
@@ -147,10 +203,12 @@ export function reviewReleaseRecord({ question, row, prompt, mapping, answer, fa
     }
   }
   const eligible = !excludedByFamily && values(gates).every(status => status === 'PASS') && !!projected
-  const classification = eligible ? (note ? 'ELIGIBLE_WITH_SOURCE_NOTE' : 'ELIGIBLE') : excludedByFamily ? 'EXCLUDED' : 'REVIEW_HOLD'
+  const classification = eligible
+    ? (verifiedCorrection ? 'ELIGIBLE_WITH_SOURCE_LIMITATION' : note ? 'ELIGIBLE_WITH_SOURCE_NOTE' : 'ELIGIBLE')
+    : excludedByFamily ? 'EXCLUDED' : 'REVIEW_HOLD'
   return {
-    eligible, classification, gates, missing, approvedAssets, projected, excludedByFamily,
-    anomaly: knownHold || heldByFamily || interactionHold || note || null,
+    eligible, classification, gates, missing, approvedAssets, projected, excludedByFamily, correction,
+    anomaly: correction?.code ?? (heldByFamily ? 'SOURCE_CASE_CHILD_REVIEW_REQUIRED' : interactionHold ?? note),
   }
 }
 
@@ -178,7 +236,7 @@ export function compileReleaseBank({ source, assetManifest, review, reference, r
   const canonicalAsset = new Map()
   function displayAsset(assetId, indexValue) {
     const sourceAsset = sourceAssets.get(assetId)
-    if (!sourceAsset || !sourceAsset.path || sourceAsset.reviewStatus !== 'VALIDATED_SOURCE_PLACEMENT') err('RELEASE_UNREVIEWED_ASSET')
+    if (!approvedReleaseAsset(sourceAsset)) err('RELEASE_UNREVIEWED_ASSET')
     let approved = canonicalAsset.get(sourceAsset.checksum)
     if (!approved) {
       approved = { id: sourceAsset.assetId, path: sourceAsset.path, checksum: sourceAsset.checksum, dimensions: sourceAsset.outputDimensions }
@@ -188,7 +246,7 @@ export function compileReleaseBank({ source, assetManifest, review, reference, r
     return { id: approved.id, label: 'Exhibit ' + (indexValue + 1) }
   }
   const contentCounts = {
-    sourceRecords: index.size, eligible: 0, reviewHold: 0, excluded: 0, publicEligible: 0,
+    sourceRecords: index.size, eligible: 0, standardEligible: 0, eligibleWithSourceLimitation: 0, reviewHold: 0, excluded: 0, publicEligible: 0,
     caseFamilies: 0, caseChildren: 0,
     interactions: Object.fromEntries([
       'SINGLE_CHOICE', 'MULTIPLE_CHOICE', 'DROPDOWN', 'MATCHING', 'ORDERING', 'DRAG_DROP',
@@ -205,8 +263,10 @@ export function compileReleaseBank({ source, assetManifest, review, reference, r
     const assetsForQuestion = original.assets.filter(asset => asset.sourceQuestionId === sourceId)
     // The original profile stays untouched; only this explicit local-release
     // JSON sets private-development eligibility. Public eligibility is zero.
-    const { eligible, classification, gates, missing, approvedAssets, projected, excludedByFamily, anomaly } =
+    const { eligible, classification, gates, missing, approvedAssets, projected, excludedByFamily, anomaly, correction } =
       reviewReleaseRecord({ question, row, prompt, mapping, answer, family, assetsForQuestion })
+    if (correction && !eligible) err('RELEASE_SOURCE_RECORD_' + sourceId + '_UNREPRESENTABLE')
+    const finalOnly = classification === 'ELIGIBLE_WITH_SOURCE_LIMITATION'
     const wrapped = Boolean(question.requiresDiagram)
     if (eligible) {
       const assetViews = [...new Map(approvedAssets.map((asset, indexValue) => {
@@ -228,6 +288,8 @@ export function compileReleaseBank({ source, assetManifest, review, reference, r
         : projected.answer
       if (caseStudyId) familyCandidates.get(caseStudyId).push(sourceId)
       contentCounts.eligible++
+      if (finalOnly) contentCounts.eligibleWithSourceLimitation++
+      else contentCounts.standardEligible++
       contentCounts.interactions[questions[sourceId].interaction.kind]++
       contentCounts.sourceInteractions[interaction.kind] = (contentCounts.sourceInteractions[interaction.kind] ?? 0) + 1
     } else if (excludedByFamily) contentCounts.excluded++
@@ -238,6 +300,7 @@ export function compileReleaseBank({ source, assetManifest, review, reference, r
       standardEligible: eligible && !caseStudyId && !interactionKinds.has(kind),
       interactiveEligible: eligible && !caseStudyId && interactionKinds.has(kind),
       ...(eligible ? { optionGroups: projected.optionGroups } : {}),
+      ...(finalOnly ? { finalOnly: true } : {}),
     })
     auditRows.push({
       sourceId, sourcePage, questionType: row.QuestionType, sourceInteractionType: interaction.kind,
@@ -245,6 +308,17 @@ export function compileReleaseBank({ source, assetManifest, review, reference, r
       assetDependencies: question.assetIds, requiredAssetIds: question.requiredAssetIds,
       anomaly,
       sourceAnswerDigest: answer.sourceAnswerDigest, normalizedMappingDigest: answer.normalizedMappingDigest,
+      ...(correction ? { sourceLimitation: {
+        limitation: correction.limitation,
+        candidateImpact: correction.impact,
+        renderingTreatment: correction.treatment,
+        sourceAnswerMapping: mapping,
+        sourceAnswerPreserved: true,
+        questionTextAltered: false,
+        answerAltered: false,
+        fabricatedContent: false,
+        ...(sourceId === 'Q360' ? { originalUnselectedImage: reviewedSourceDropdownImage } : {}),
+      } } : {}),
     })
   }
 
@@ -269,7 +343,9 @@ export function compileReleaseBank({ source, assetManifest, review, reference, r
   })
   if (contentCounts.eligible + contentCounts.reviewHold + contentCounts.excluded !== index.size ||
       Object.keys(questions).length !== contentCounts.eligible || Object.keys(definitions).length !== contentCounts.eligible ||
-      contentCounts.interactions.IMAGE_HOTSPOT !== 0 || !contentCounts.eligible) err('RELEASE_ELIGIBILITY_RECONCILIATION_FAILED')
+      contentCounts.interactions.IMAGE_HOTSPOT !== 0 || contentCounts.eligible !== index.size ||
+      contentCounts.eligibleWithSourceLimitation !== Object.keys(corrections).length ||
+      contentCounts.standardEligible + contentCounts.eligibleWithSourceLimitation !== index.size) err('RELEASE_ELIGIBILITY_RECONCILIATION_FAILED')
   if ([...questions.Q253?.interaction?.interaction?.targets ?? []].length !== 3 ||
       Object.keys(definitions.Q253?.response?.selections ?? {}).length !== 3 ||
       questions.Q104?.interaction?.kind !== 'DROPDOWN_HOTSPOT' || questions.Q225?.interaction?.kind !== 'DROPDOWN_HOTSPOT')
@@ -285,6 +361,14 @@ export function compileReleaseBank({ source, assetManifest, review, reference, r
   const audit = {
     scope: AUDIT_SCOPE, bankVersion, policyVersion: POLICY_VERSION, sourceAnswerDifferences: verification.unauthorizedDifferences,
     sourceAssetProof, contentCounts, rows: auditRows,
+    sourceIntegrity: {
+      sourceRecords: verification.sourceQuestions,
+      sourceAnswerMappings: index.size,
+      compared: verification.publishedQuestionsChecked,
+      unauthorizedDifferences: verification.unauthorizedDifferences,
+      missingMappings: verification.missingMappings,
+      answersAltered: 0,
+    },
     families: original.caseStudies.map(family => ({
       id: family.id, fullChildIds: family.sourceQuestionIds, eligibleChildIds: familyCandidates.get(family.id),
       sourceScenarioPages: family.scenarioSourcePages,

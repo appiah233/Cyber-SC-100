@@ -56,6 +56,7 @@ export function createCandidateJourney(options: CandidateJourneyOptions) {
   if (!prepared.ok) throw new StorageError('CORRUPT')
   const inventory = Object.freeze([...prepared.inventory.eligibleIds])
   const allowed = new Set(inventory)
+  const finalOnly = new Set(prepared.inventory.eligibleQuestions.filter(({ finalOnly }) => finalOnly).map(({ sourceId }) => sourceId))
 
   const plan = (cycle: Pick<TrackedCycle, 'id' | 'bankVersion' | 'consumedSourceIds' | 'reservedSourceIds'>, ordinal: number) => {
     const result = generateCycleBatch({ bank, eligibilityPolicy, seed: cycle.id + ':exam-' + ordinal, cycleState: {
@@ -86,6 +87,16 @@ export function createCandidateJourney(options: CandidateJourneyOptions) {
       || (active.status === 'COMPLETE' ? active.consumedSourceIds.length !== inventory.length : active.consumedSourceIds.length >= inventory.length)) {
       throw new StorageError('CORRUPT')
     }
+    const lastIds = new Set(last.sourceIds)
+    const marked = last.sourceIds.filter(key => finalOnly.has(key))
+    if (last.kind === 'FINAL_REMAINDER_BATCH') {
+      // Reject a persisted final draft that silently omitted an ID from the
+      // complete pinned universe, or changed its deferred placement evidence.
+      const usedBefore = new Set(active.consumedSourceIds.filter(key => !lastIds.has(key)))
+      if (inventory.some(key => !usedBefore.has(key) && !lastIds.has(key))
+        || marked.length !== (last.finalOnlySourceIds?.length ?? 0)
+        || marked.some((key, index) => key !== last.finalOnlySourceIds?.[index])) throw new StorageError('CORRUPT')
+    } else if (marked.length) throw new StorageError('CORRUPT')
     return last
   }
 

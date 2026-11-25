@@ -175,7 +175,7 @@ test('actual Pages-prefix synthetic candidate consumes its exact bank over norma
   await expect(cycleRegion(page)).toContainText('23')
   await press(cycleRegion(page).getByRole('button', { name: 'Next exam', exact: true }))
   await expect(startButton(page)).toBeEnabled()
-  await expect(title(page, 'Final Examination Batch')).toBeVisible()
+  await expect(title(page, 'Final Exam')).toBeVisible()
   const finalDraft = await releaseStore(page)
   expect(finalDraft.attempt?.batch).toMatchObject({ batchMode: 'FINAL_REMAINDER' })
   await press(startButton(page))

@@ -176,8 +176,9 @@ export function validateExamBatch(batch: ExamBatch): BatchValidation {
     }
     previousRank = rank
   }
-  if (questionIds.size > NORMAL_QUESTION_COUNT || (batch.batchMode === 'ADAPTIVE'
-    ? questionIds.size !== NORMAL_QUESTION_COUNT : questionIds.size === 0 || questionIds.size >= NORMAL_QUESTION_COUNT)) {
+  // Inventory and the persisted generated plan establish that a final is
+  // genuinely all remaining items. Presentation itself has no 59-item cap.
+  if (batch.batchMode === 'ADAPTIVE' ? questionIds.size !== NORMAL_QUESTION_COUNT : questionIds.size === 0) {
     return { ok: false, reason: 'SECTION_CARDINALITY' }
   }
   return { ok: true }

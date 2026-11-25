@@ -9,6 +9,8 @@ declare module 'virtual:local-release-display' {
     readonly contentCounts: {
       readonly sourceRecords: number
       readonly eligible: number
+      readonly standardEligible: number
+      readonly eligibleWithSourceLimitation: number
       readonly reviewHold: number
       readonly excluded: number
       readonly publicEligible: number

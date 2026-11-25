@@ -15,13 +15,12 @@ node scripts/question-bank/build-release-bank.mjs \
   "$NEW_PRIVATE_BANK_DIRECTORY"
 ```
 
-Use Python 3 with PyMuPDF for the PDF placement check. The compiler refuses missing or changed historical digests, checks every source mapping against the independent oracle, then reviews identity, interaction instructions, asset dependency, case relationship and known anomalies per source record. It verifies each declared image placement is above the answer section of the pinned PDF. Files: `release-bank.json` (eligible display data and inventory), `release-scoring.json` (separate verified ID mappings), `release-audit.json` (full disposition for all records), and `release-manifest.json` (checksums); only redacted counts appear on standard output.
+Use Python 3 with PyMuPDF for the PDF placement check. The compiler refuses missing or changed historical digests, checks every source mapping against the independent oracle, then reviews identity, interaction instructions, asset dependency, case relationship and known anomalies per source record. The five documented source-limitation records are included with their exact source presentation and original printed mappings, reserved for the final examination; detailed limitations stay in the protected audit. A source correction that cannot be represented faithfully stops compilation with that record's ID. It verifies each declared image placement is above the answer section of the pinned PDF. Files: `release-bank.json` (eligible display data and inventory), `release-scoring.json` (separate verified ID mappings), `release-audit.json` (full disposition for all records), and `release-manifest.json` (checksums); only redacted counts appear on standard output.
 
-To exercise the protected site, supply the authorized or test-only local configuration explicitly. There is no default exam duration or passing percentage here:
+To exercise the protected site, supply the approved duration or an explicit test-only duration. The release mode pins the owner-approved unrounded 90% passing threshold; a conflicting `EXAM_PASSING_PERCENTAGE` override is refused. The historical reference-only mode remains separately configurable.
 
 ```sh
 EXAM_DURATION_MINUTES="$CONFIGURED_MINUTES" \
-EXAM_PASSING_PERCENTAGE="$CONFIGURED_PASSING_PERCENTAGE" \
 node scripts/question-bank/build-candidate.mjs --release \
   "$PRIVATE_BANK_DIRECTORY" "$NEW_PRIVATE_BROWSER_OUTPUT"
 

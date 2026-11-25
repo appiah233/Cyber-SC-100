@@ -249,8 +249,8 @@ export default function App({ preview, onAction }: {
   const markedCount = questionStates.filter(({ marked }) => marked).length
   const sectionCount = active?.count ?? data.questions.length
   const unansweredCount = Math.max(0, sectionCount - answeredCount)
-  const overallPosition = Math.min(total, data.sections.slice(0, Math.max(0, activeIndex)).reduce((count, section) => count + section.count, 0)
-    + Math.min(data.position + 1, sectionCount))
+  const sectionOffset = data.sections.slice(0, Math.max(0, activeIndex)).reduce((count, section) => count + section.count, 0)
+  const overallPosition = Math.min(total, sectionOffset + Math.min(data.position + 1, sectionCount))
   const status = data.status ?? { label: 'Not saved' }
   const expired = data.timer?.expired || (data.timer !== undefined && data.timer.remainingMs <= 0)
   const actionsDisabled = data.readOnly === true || Boolean(data.finalizing || expired) || Boolean(preview && !onAction)
@@ -273,7 +273,7 @@ export default function App({ preview, onAction }: {
   const finishLabel = isCase ? 'Finish case study' : isInteractive ? 'Finish interactive section' : 'Finish section'
   const unnamedTitle = data.synthetic === true ? 'Practice examination' : 'Examination'
   const title = data.examTitle ?? unnamedTitle
-  const finalBatchLabel = data.batchMode === 'FINAL_REMAINDER' ? 'Final Examination Batch' : null
+  const finalBatchLabel = data.batchMode === 'FINAL_REMAINDER' ? 'Final Exam' : null
   const oneSection = data.sections.length === 1
   const currentMarked = Boolean(question && markSet.has(question.id))
   const filterQuestions = (currentFilter: ReviewFilter) => questionStates.filter(({ state, marked }) =>
@@ -531,22 +531,27 @@ export default function App({ preview, onAction }: {
             <details className="panel navigator-panel" open={navigatorOpen} onToggle={(event) => setNavigatorOpen(event.currentTarget.open)}>
               <summary ref={navigatorSummaryRef}>Question navigator</summary>
               <div className="navigator-content">
-                <p>{answeredCount} answered · {unansweredCount} unanswered · {markedCount} marked</p>
-                <div className="navigator-filter">
-                  <Select label="Show questions" value={navFilter}
-                    onChange={(event) => setNavFilter(event.currentTarget.value as ReviewFilter)}>
-                    <option value="all">All questions</option>
-                    <option value="unfinished">Unanswered or incomplete</option>
-                    <option value="marked">Marked for review</option>
-                  </Select>
-                </div>
                 <nav aria-label="Current section questions">
+                  <div className="navigator-position">
+                    <p className="navigator-exam-position">Exam position <strong>{overallPosition} / {total}</strong></p>
+                    <p>Questions in this section: <strong>{activeLabel}</strong></p>
+                  </div>
+                  <p>{answeredCount} answered · {unansweredCount} unanswered · {markedCount} marked</p>
+                  <div className="navigator-filter">
+                    <Select label="Show questions" value={navFilter}
+                      onChange={(event) => setNavFilter(event.currentTarget.value as ReviewFilter)}>
+                      <option value="all">All questions</option>
+                      <option value="unfinished">Unanswered or incomplete</option>
+                      <option value="marked">Marked for review</option>
+                    </Select>
+                  </div>
                   {filterQuestions(navFilter).length === 0 ? <p>No questions match this filter.</p> :
                     <div className="question-grid">
                       {filterQuestions(navFilter).map(({ item, position, state, marked }) => (
                         <Button key={item.id} className={`number-button number-button--${state.toLowerCase()}`}
                           aria-label={`Question ${position + 1}, ${state.toLowerCase()}${marked ? ', marked for review' : ''}${position === data.position ? ', current question' : ''}`}
                           aria-current={position === data.position ? 'true' : undefined}
+                          aria-description={`Exam question ${sectionOffset + position + 1} of ${total}`}
                           disabled={actionsDisabled} onClick={() => navigate(position)}
                         >
                           <span>{position + 1}</span>

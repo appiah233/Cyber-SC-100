@@ -3,6 +3,7 @@ import display from 'virtual:local-release-display'
 import App from '../app/App'
 import { CycleJourney } from './CycleJourney'
 import type { CandidateJourneyOptions } from './CycleJourney'
+import releasePolicy from '../domain/sc100-release-policy.json'
 import type { ScoringBank } from '../domain/scoring'
 
 const root = document.getElementById('root')
@@ -14,9 +15,14 @@ function configuration(): CandidateJourneyOptions {
   const { inventory, bankVersion, questions, contexts, examTiming, scoringPolicy, contentCounts } = display
   if (window.location.protocol !== 'http:' || window.location.hostname !== '127.0.0.1'
     || display.scope !== 'PRIVATE_RELEASE_CANDIDATE_ONLY' || inventory.version !== bankVersion
-    || !examTiming || !scoringPolicy || contentCounts.publicEligible !== 0) throw new Error('Protected release unavailable.')
+    || !examTiming || !scoringPolicy || contentCounts.publicEligible !== 0
+    || scoringPolicy.passingPercentage !== releasePolicy.passingPercentage || scoringPolicy.scoringVersion !== releasePolicy.scoringVersion
+    || scoringPolicy.postExamReviewPolicy !== releasePolicy.postExamReviewPolicy) throw new Error('Protected release unavailable.')
   const metadata = new Map(inventory.questions.filter(q => q.developmentValidated && !q.held).map(q => [q.sourceId, q]))
-  if (!metadata.size || metadata.size !== contentCounts.eligible || Object.keys(questions).length !== metadata.size
+  const deferred = [...metadata.values()].filter(item => item.finalOnly).length
+  if (!metadata.size || metadata.size !== contentCounts.eligible || metadata.size !== contentCounts.sourceRecords
+    || deferred !== contentCounts.eligibleWithSourceLimitation || metadata.size - deferred !== contentCounts.standardEligible
+    || Object.keys(questions).length !== metadata.size
     || ![...metadata].every(([key]) => Object.hasOwn(questions, key))) throw new Error('Protected release unavailable.')
 
   const loadBank = async (): Promise<ScoringBank> => {
@@ -32,7 +38,9 @@ function configuration(): CandidateJourneyOptions {
 
   return {
     id: 'protected-sc100-release',
-    idbName: 'examination-hub-protected-release-v1',
+    // Do not overwrite or retroactively rescore results from the earlier
+    // protected 352-question release or its distinct scoring policy.
+    idbName: 'examination-hub-protected-release-v2',
     bank: inventory,
     eligibilityPolicy: 'DEVELOPMENT',
     sourceFor: (batch) => ({
