@@ -10,3 +10,5 @@ npm run dev
 Open the Vite URL under `/Cyber-SC-100/`. Start explicitly, take the sections in order and review responses before submitting each section. A submitted section cannot be reopened through the app.
 
 See [the Phase 5 runbook](docs/PHASE-5-CANDIDATE-EXAM.md) for local testing and the separate protected development workflow. Do not place any source PDF, answer keys, private question bank, or generated protected build in this repository, GitHub Actions, or GitHub Pages.
+
+The [adaptive batch policy](docs/ADAPTIVE-BATCH-EXHAUSTION.md) defines 59 as the preferred size, not a minimum. Existing sections use their actual counts. The cycle engine keeps using unused eligible questions after a special pool is exhausted and does not pad the final batch.

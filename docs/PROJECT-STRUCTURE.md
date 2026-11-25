@@ -1,5 +1,7 @@
 # Project structure
 
+> Current batch behavior follows the [adaptive batch policy](ADAPTIVE-BATCH-EXHAUSTION.md): 59 is a target and maximum, not a minimum.
+
 The initial repository intentionally contains documentation only. Planned areas are `src/` for static UI and domain code, `scripts/` for development-time tooling, `tests/` for verification, and `.github/workflows/` for future CI. No empty placeholder source trees or workflows are committed in Phase 0.
 
 ## Decision and task ledger

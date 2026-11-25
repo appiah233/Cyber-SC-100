@@ -54,8 +54,21 @@ function witnessCheck(result: ReturnType<typeof analyzeCycleCapacity>, n: number
     }
   }
   expect(seen.size).toBe(n * 59)
-  expect(result.anticipatedRemainder.size).toBe(result.anticipatedRemainder.sourceIds.length)
+  expect(result.afterNormalInventory.size).toBe(result.afterNormalInventory.sourceIds.length)
+  expect(result.afterNormalInventory.sourceIds.every((id) => !seen.has(id))).toBe(true)
+  expect(result.adaptiveWitness).toHaveLength(result.adaptiveFullBatches)
+  for (const batch of result.adaptiveWitness) {
+    const ids = batch.flatMap(({ questionIds }) => questionIds)
+    expect(ids).toHaveLength(59)
+    for (const id of ids) {
+      expect(seen.has(id)).toBe(false)
+      seen.add(id)
+    }
+  }
   expect(result.anticipatedRemainder.sourceIds.every((id) => !seen.has(id))).toBe(true)
+  expect(result.anticipatedRemainder.size).toBe(result.anticipatedRemainder.sourceIds.length)
+  expect(result.anticipatedRemainder.size).toBe(result.finalRemainderSize)
+  expect(seen.size + result.finalRemainderSize).toBe(result.totalEligibleQuestions)
 }
 
 describe('exact cycle capacity', () => {
@@ -83,7 +96,8 @@ describe('exact cycle capacity', () => {
     witnessCheck(result, 0)
     if (!result.ok) throw new Error(result.reason)
     expect(result.limitingConstraints).toEqual(['CASE_STUDY'])
-    expect(result.anticipatedRemainder.size).toBe(67)
+    expect(result).toMatchObject({ adaptiveFullBatches: 1, finalRemainderSize: 8 })
+    expect(result.afterNormalInventory.size).toBe(67)
   })
 
   it('finds the qualifying case pair rather than spending an essential standard pool', () => {
@@ -109,7 +123,8 @@ describe('exact cycle capacity', () => {
     if (!result.ok) throw new Error(result.reason)
     expect(result.independentBounds).toEqual({ caseStudy: 1, standard: 1, interactive: 1, totalEligible: 1 })
     expect(result.limitingConstraints).toEqual(['OVERLAPPING_POOLS'])
-    expect(result.anticipatedRemainder.size).toBe(59)
+    expect(result).toMatchObject({ adaptiveFullBatches: 1, finalRemainderSize: 0 })
+    expect(result.afterNormalInventory.size).toBe(59)
   })
 
   it('suppresses held, consumed and reserved IDs in both witness and remainder', () => {
