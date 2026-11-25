@@ -4,7 +4,7 @@ Examination Hub is a browser-only application. The public build is a **synthetic
 
 ## Two separate content decisions
 
-1. **Candidate eligibility:** An item can enter a protected test examination only when its source identity, answer mapping, interaction, assets, case relationship, and any recorded anomaly have passed the applicable gates. Preserve the source answer exactly. Hold items that cannot be rendered or scored faithfully. The number of source records is not a required count of eligible items.
+1. **Candidate eligibility:** The corrected SC-100 policy requires all 357 source records in each protected cycle. A documented source limitation does not exclude an item when its original text, options, printed answer, available assets and interaction can be represented faithfully. Retain the limitation in the private audit, not the candidate view. If any source record cannot be represented or scored faithfully, stop the corrected release and report the exact evidence; never invent a replacement.
 2. **Public distribution:** Verify authorization for the particular runtime prompts, options, scenarios, diagrams, and grading mappings before making them public. Candidate eligibility is not a license. The existing public build does not import or package the protected candidate. If the source cannot be cleared, a public release needs independently authored or appropriately licensed content, under a separately approved scope.
 
 Never publish the source PDF, extraction archives, raw answer maps, raw review records, private validation packages, or developer-only evidence. Keep them outside the repository, public Actions jobs and artifacts, and GitHub Pages. A separately cleared static release would need only the normalized display records and referenced assets, an examination policy, and the minimum grading data required by the app. Approval to use that exact public payload and a verified way to separate it from internal inputs are prerequisites, not features of the public preview.
@@ -20,17 +20,17 @@ node scripts/question-bank/build-release-bank.mjs \
   "$SOURCE_PDF" "$SOURCE_EXTRACTION" "$ASSET_MANIFEST" "$REVIEW_METADATA" \
   "$REFERENCE_MANIFEST" "$SOURCE_ORACLE" "$NEW_PRIVATE_BANK_DIR"
 
-EXAM_DURATION_MINUTES="$TEST_MINUTES" EXAM_PASSING_PERCENTAGE="$TEST_PERCENTAGE" \
+EXAM_DURATION_MINUTES="$TEST_MINUTES" \
   node scripts/question-bank/build-candidate.mjs --release "$NEW_PRIVATE_BANK_DIR" "$NEW_PRIVATE_BUILD_DIR"
 
 node scripts/question-bank/serve-candidate.mjs "$NEW_PRIVATE_BUILD_DIR" 4179 --pages-equivalent
 ```
 
-Use fresh output directories outside any Git checkout. Visit `http://127.0.0.1:4179/Cyber-SC-100/` on the same computer; the server intentionally provides no remote access. Test minutes and passing percentage are evaluation settings only. The browser retains local attempts and results; use a fresh browser profile for clean-state verification.
+Use fresh output directories outside any Git checkout. Visit `http://127.0.0.1:4179/Cyber-SC-100/` on the same computer; the server intentionally provides no remote access. The corrected SC-100 passing threshold is **90%**, compared before display rounding using each exam's actual maximum score. Exam duration is configurable and still requires an owner decision. Explicit test minutes are for evaluation only. The browser retains local attempts and results; use a fresh browser profile for clean-state verification. The corrected content and policy do not change previous attempts' persisted scores.
 
 ## What the app protects
 
-The normal exam UI does not show correctness, scores, explanations, or pass/fail information while an exam is active. Manual submission or expiry freezes the answer snapshot before scoring. Results use the actual number of questions and the approved aggregate-only review policy. An author who supplies a scoring threshold or time limit must approve the production values; synthetic test values are not official cutoffs or durations.
+The normal exam UI does not show correctness, scores, explanations, or pass/fail information while an exam is active. Manual submission or expiry freezes the answer snapshot before scoring. Results use the actual number of questions and the approved aggregate-only review policy. The synthetic preview is not an official certification exam and its synthetic settings do not set the SC-100 duration or passing policy.
 
 A static browser app cannot hide answer data from someone able to inspect the resources it downloads. Deferring the scoring resource until finalization enforces the normal UI sequence, not confidentiality. Browser storage, time, and tab coordination are not proctoring or tamper resistance. There is no backend, authentication, or secret client credential.
 

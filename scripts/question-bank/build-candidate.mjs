@@ -10,6 +10,7 @@ import { build } from 'vite'
 import { assertOutsideWorktree } from './local-boundary.mjs'
 import { projectProtectedScoring } from './local-score-projection.mjs'
 import { RELEASE_SCOPE, RELEASE_SCORING_SCOPE } from './release-bank.mjs'
+import sc100ReleasePolicy from '../../src/domain/sc100-release-policy.json' with { type: 'json' }
 
 const repo = await realpath(fileURLToPath(new URL('../../', import.meta.url)))
 const pinned = new Map([
@@ -22,9 +23,9 @@ const version = 'sc100-c1afae23f990-7cab33ce7722'
 // Independently reproduced offline from the pinned PDF, extraction, oracle,
 // assets and review metadata. Do not trust mutable checksums beside input files.
 const releasePins = Object.freeze({
-  version: 'sc100-release-b050d8bdf147ecce012b',
-  display: '9e1aeb5e21e5bb143b10566dd5d5ec949013803982661604c5e79b3428eaa626',
-  scoring: '009df81717ee57bbe8ce516c7aa896c77ef2983881bf0509fe572a2c7a9b6544',
+  version: 'sc100-release-19457c096483a898a8b0',
+  display: 'd77e9c13610b2453354e323585d3d355b61aae85cc11775788197d3674de9dbf',
+  scoring: '9666be523c2180aabe0fcfccf271c2ab2db043ea98ad85dd7e6e769e8b4b83d6',
 })
 const contained = (dir, path) => {
   const rel = relative(dir, path)
@@ -68,11 +69,13 @@ function localScoringPolicy(env) {
 async function main() {
   localOnly()
   const examTiming = localExamTiming(process.env)
-  const scoringPolicy = localScoringPolicy(process.env)
+  const suppliedScoringPolicy = localScoringPolicy(process.env)
   const [mode, ...rest] = process.argv.slice(2)
   const release = mode === '--release'
+  const scoringPolicy = release ? sc100ReleasePolicy : suppliedScoringPolicy
   const [input, output, ...extra] = release ? rest : [mode, ...rest]
-  if (release && (!examTiming || !scoringPolicy)) throw new Error('The protected release needs explicit duration and passing policy.')
+  if (release && (!examTiming || (suppliedScoringPolicy && suppliedScoringPolicy.passingPercentage !== scoringPolicy.passingPercentage)))
+    throw new Error('The protected release requires an explicit exam duration and its owner-approved passing policy.')
   if (!input || !output || extra.length) throw new Error('Supply an external approved bank directory and a new external output directory.')
   const bankDir = await realpath(resolve(input))
   const outDir = join(await realpath(dirname(resolve(output))), basename(resolve(output)))
@@ -101,7 +104,10 @@ async function main() {
       if (candidate.scope !== RELEASE_SCOPE || scoring.scope !== RELEASE_SCORING_SCOPE ||
           candidate.bankVersion !== releasePins.version || scoring.bankVersion !== releasePins.version ||
           candidate.inventory.version !== releasePins.version || candidate.contentCounts.publicEligible !== 0 ||
-          candidate.inventory.questions.some(question => question.productionEligible) ||
+          candidate.contentCounts.eligible !== candidate.contentCounts.sourceRecords ||
+          candidate.contentCounts.standardEligible + candidate.contentCounts.eligibleWithSourceLimitation !== candidate.contentCounts.sourceRecords ||
+          candidate.inventory.questions.some(question => question.productionEligible || !question.developmentValidated || question.held) ||
+          candidate.inventory.questions.filter(question => question.finalOnly === true).length !== candidate.contentCounts.eligibleWithSourceLimitation ||
           candidate.inventory.caseStudies.some(family => family.productionEligible))
         throw new Error('Invalid protected release scope.')
       ;({ assetFiles, ...payload } = candidate)

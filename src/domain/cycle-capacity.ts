@@ -1,7 +1,7 @@
 import { allocateRoles } from './batch-allocation'
-import { generateBatch, prepareBatchInventory } from './batch-engine'
+import { generateBatch, ordinaryBatchInventory, ordinaryFullBatchSlots, prepareBatchInventory } from './batch-engine'
 import type { BatchGenerationInput } from './batch-engine'
-import { NORMAL_QUESTION_COUNT, NORMAL_SECTIONS } from './model'
+import { NORMAL_SECTIONS } from './model'
 import type { ExamSection, SourceQuestionId } from './model'
 
 const [firstCase, secondCase, standard, interactive] = NORMAL_SECTIONS
@@ -44,7 +44,7 @@ export type CycleCapacityResult =
     readonly adaptiveWitness: readonly (readonly ExamSection[])[]
     /** Inventory after normal batches, including future adaptives. */
     readonly afterNormalInventory: CapacityRemainderProjection
-    /** Projected short final exam, not a guarantee of its identities for a different seed. */
+    /** Projected terminal residual, not a guarantee of its identities for a different seed. */
     readonly anticipatedRemainder: CapacityRemainderProjection
     readonly diagnostics: Diagnostics
   }
@@ -228,7 +228,7 @@ function projection(ids: readonly SourceQuestionId[]): CapacityRemainderProjecti
  * prunes without rebuilding the question graph. One flow materializes a
  * witness. For pathological metadata with many families the vector search
  * remains combinatorial. The balance can be partitioned into adaptive full
- * batches and one short final exam without any remaining role quota.
+ * batches and one final exam containing the complete residual, including eligible deferred items.
  */
 export function analyzeCycleCapacity(input: CycleCapacityInput): CycleCapacityResult {
   const prepared = prepareBatchInventory(input)
@@ -243,7 +243,9 @@ export function analyzeCycleCapacity(input: CycleCapacityInput): CycleCapacityRe
       anticipatedRemainder: empty, diagnostics: prepared.diagnostics,
     })
   }
-  const { inventory, diagnostics } = prepared
+  const { inventory: all, diagnostics } = prepared
+  const inventory = ordinaryBatchInventory(all)
+  const deferredCount = all.eligibleIds.length - inventory.eligibleIds.length
   const { families, standardPool, interactivePool, globalUnion } = indexInventory(inventory)
   const canonical = new Set<SourceQuestionId>()
   for (const family of families) {
@@ -256,7 +258,7 @@ export function analyzeCycleCapacity(input: CycleCapacityInput): CycleCapacityRe
     caseStudy: independentCaseBound(families),
     standard: Math.floor(standardPool.size / standard.count),
     interactive: Math.floor(interactivePool.size / interactive.count),
-    totalEligible: Math.floor(inventory.eligibleQuestions.length / NORMAL_QUESTION_COUNT),
+    totalEligible: ordinaryFullBatchSlots(inventory.eligibleIds.length, deferredCount),
   })
   const upperBound = Math.min(...Object.values(independentBounds))
   let maximumFullBatches = upperBound
@@ -279,9 +281,9 @@ export function analyzeCycleCapacity(input: CycleCapacityInput): CycleCapacityRe
     ? ['OVERLAPPING_POOLS']
     : bounds.filter(([, count]) => count === maximumFullBatches).map(([role]) => role)
   const used = new Set(witness.flatMap((batch) => batch.flatMap((section) => section.questionIds)))
-  const sourceIds = inventory.eligibleIds.filter((id) => !used.has(id))
-  const adaptiveFullBatches = Math.floor(sourceIds.length / NORMAL_QUESTION_COUNT)
-  const finalRemainderSize = sourceIds.length % NORMAL_QUESTION_COUNT
+  const sourceIds = all.eligibleIds.filter((id) => !used.has(id))
+  const ordinaryRemaining = inventory.eligibleIds.filter((id) => !used.has(id)).length
+  const adaptiveFullBatches = ordinaryFullBatchSlots(ordinaryRemaining, deferredCount)
   const adaptiveWitness: (readonly ExamSection[])[] = []
   // Removing questions cannot re-create a normal assignment. Use the same
   // seeded allocator to provide a real partition instead of inventing IDs.
@@ -296,19 +298,20 @@ export function analyzeCycleCapacity(input: CycleCapacityInput): CycleCapacityRe
     adaptiveWitness.push(plan.batch.sections)
     plan.batch.sourceIds.forEach((id) => used.add(id))
   }
+  const remainder = projection(sourceIds.filter((id) => !used.has(id)))
   return Object.freeze({
     ok: true,
     maximumFullBatches,
     maximumNormalFullBatches: maximumFullBatches,
     adaptiveFullBatches,
-    finalRemainderSize,
-    totalEligibleQuestions: inventory.eligibleIds.length,
+    finalRemainderSize: remainder.size,
+    totalEligibleQuestions: all.eligibleIds.length,
     limitingConstraints: Object.freeze(limitingConstraints),
     independentBounds,
     witness,
     adaptiveWitness: Object.freeze(adaptiveWitness),
     afterNormalInventory: projection(sourceIds),
-    anticipatedRemainder: projection(sourceIds.filter((id) => !used.has(id))),
+    anticipatedRemainder: remainder,
     diagnostics,
   })
 }

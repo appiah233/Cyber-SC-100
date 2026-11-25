@@ -19,6 +19,8 @@ export interface BatchQuestion {
   readonly developmentValidated: boolean
   readonly productionEligible: boolean
   readonly held?: boolean
+  /** Reviewed genuine source item deliberately bundled into the terminal residual. */
+  readonly finalOnly?: true
   readonly standardEligible: boolean
   readonly interactiveEligible?: boolean
   readonly optionGroups?: readonly BatchOptionGroup[]
@@ -58,6 +60,7 @@ export type NormalBatchFailure =
   | 'INTERACTIVE_POOL_EXHAUSTED'
   | 'MULTIPLE_CONSTRAINTS_EXHAUSTED'
   | 'CROSS_SECTION_ALLOCATION_UNSATISFIABLE'
+  | 'FINAL_ONLY_SOURCE_REMAINDER'
 
 export type BatchGenerationFailure =
   | NormalBatchFailure
@@ -144,6 +147,8 @@ export interface GeneratedAdaptiveBatch extends GeneratedFlexibleBatch {
 export interface GeneratedRemainderBatch extends GeneratedFlexibleBatch {
   readonly kind: 'FINAL_REMAINDER_BATCH'
   readonly batchMode: 'FINAL_REMAINDER'
+  /** Internal planning evidence, not a candidate-facing label or disclosure. */
+  readonly finalOnlySourceIds?: readonly string[]
 }
 
 export type GeneratedBatch = GeneratedNormalBatch | GeneratedAdaptiveBatch | GeneratedRemainderBatch
@@ -242,6 +247,7 @@ export function prepareBatchInventory(
     if (!question || !key(question.sourceId) || !knownKinds.has(question.interactionKind)
       || !flags(question) || typeof question.standardEligible !== 'boolean'
       || (question.held !== undefined && typeof question.held !== 'boolean')
+      || (question.finalOnly !== undefined && question.finalOnly !== true)
       || (question.interactiveEligible !== undefined && typeof question.interactiveEligible !== 'boolean')
       || (question.interactiveEligible === true && !interactiveRank.has(question.interactionKind))
       || !validOptionGroups(question.optionGroups)) return fail('INVALID_BANK')
@@ -317,6 +323,30 @@ export function prepareBatchInventory(
   return { ok: true, diagnostics, inventory: { eligibleQuestions, eligibleIds: Object.freeze([...eligibleIds]), standardIds, interactiveIds, caseFamilies } }
 }
 
+/** The ordinary allocator may never take a final-only item. Keep approved
+ * family and interaction roles intact when projecting its smaller pool. */
+export function ordinaryBatchInventory(inventory: PreparedBatchInventory): PreparedBatchInventory {
+  const ordinary = inventory.eligibleQuestions.filter((question) => !question.finalOnly)
+  if (ordinary.length === inventory.eligibleQuestions.length) return inventory
+  const keys = new Set(ordinary.map(({ sourceId }) => sourceId))
+  return {
+    eligibleQuestions: ordinary,
+    eligibleIds: inventory.eligibleIds.filter((id) => keys.has(id)),
+    standardIds: inventory.standardIds.filter((id) => keys.has(id)),
+    interactiveIds: inventory.interactiveIds.filter((id) => keys.has(id)),
+    caseFamilies: inventory.caseFamilies.map(({ id, questionIds }) => ({
+      id, questionIds: questionIds.filter((key) => keys.has(key)),
+    })).filter(({ questionIds }) => questionIds.length > 0),
+  }
+}
+
+/** When genuine deferred content exists, don't spend the last complete
+ * ordinary block just to strand a separate deferred-only mini-exam. */
+export function ordinaryFullBatchSlots(ordinaryCount: number, finalOnlyCount: number): number {
+  const reservedOrdinary = finalOnlyCount > 0 && ordinaryCount > 0 ? 1 : 0
+  return Math.floor((ordinaryCount - reservedOrdinary) / NORMAL_QUESTION_COUNT)
+}
+
 interface Ranking {
   readonly families: PreparedBatchInventory['caseFamilies']
   readonly children: ReadonlyMap<string, readonly string[]>
@@ -381,11 +411,11 @@ function normalSections(ranking: Ranking): readonly NormalSection[] | null {
   return best
 }
 
-function rawShortages(diagnostics: BatchDiagnostics): NormalBatchFailure[] {
+function rawShortages(inventory: PreparedBatchInventory): NormalBatchFailure[] {
   const constraints: NormalBatchFailure[] = []
-  if (diagnostics.caseFamiliesWithThreeChildren < 2) constraints.push('CASE_STUDY_CHILDREN_EXHAUSTED')
-  if (diagnostics.eligibleUnusedStandardQuestions < STANDARD_COUNT) constraints.push('STANDARD_POOL_INSUFFICIENT')
-  if (diagnostics.eligibleUnusedInteractiveQuestions < INTERACTIVE_COUNT) constraints.push('INTERACTIVE_POOL_EXHAUSTED')
+  if (inventory.caseFamilies.filter(({ questionIds }) => questionIds.length >= CASE_COUNT).length < 2) constraints.push('CASE_STUDY_CHILDREN_EXHAUSTED')
+  if (inventory.standardIds.length < STANDARD_COUNT) constraints.push('STANDARD_POOL_INSUFFICIENT')
+  if (inventory.interactiveIds.length < INTERACTIVE_COUNT) constraints.push('INTERACTIVE_POOL_EXHAUSTED')
   return constraints
 }
 
@@ -396,8 +426,8 @@ function flexibleSections(
   input: BatchGenerationInput,
   inventory: PreparedBatchInventory,
   ranking: Ranking,
+  limit: number,
 ): readonly RemainderSection[] {
-  const limit = Math.min(NORMAL_QUESTION_COUNT, inventory.eligibleIds.length)
   const placed = new Set<string>()
   const consume = (pool: readonly string[], count = limit): readonly string[] => {
     const selected: string[] = []
@@ -552,27 +582,36 @@ export function generateBatch(input: BatchGenerationInput): BatchGenerationResul
   const prepared = prepareBatchInventory(input)
   if (!prepared.ok) return prepared
   const { inventory, diagnostics } = prepared
-  const ranked = rankedInventory(input, inventory)
-  const shortages = rawShortages(diagnostics)
-  if (shortages.length === 0) {
+  const ordinary = ordinaryBatchInventory(inventory)
+  const deferredCount = inventory.eligibleIds.length - ordinary.eligibleIds.length
+  const final = ordinaryFullBatchSlots(ordinary.eligibleIds.length, deferredCount) === 0
+  const selected = final ? inventory : ordinary
+  const ranked = rankedInventory(input, selected)
+  const shortages = rawShortages(ordinary)
+  if (!final && shortages.length === 0) {
     const assignment = normalSections(ranked)
     if (assignment) {
       const sections = snapshotSections(assignment)
       const batch: GeneratedNormalBatch = Object.freeze({
         kind: 'NORMAL_BATCH',
         batchMode: 'NORMAL',
-        ...generatedFields(input, inventory, sections),
+        ...generatedFields(input, selected, sections),
         sections,
       })
       return { ok: true, batch, diagnostics }
     }
   }
-  const constraints = Object.freeze(shortages.length > 0 ? shortages : ['CROSS_SECTION_ALLOCATION_UNSATISFIABLE' as const])
+  const constraints = Object.freeze(final && deferredCount > 0 ? ['FINAL_ONLY_SOURCE_REMAINDER' as const]
+    : shortages.length > 0 ? shortages : ['CROSS_SECTION_ALLOCATION_UNSATISFIABLE' as const])
   const normalFailure = constraints.length > 1 ? 'MULTIPLE_CONSTRAINTS_EXHAUSTED' : constraints[0]!
-  const sections = snapshotSections(flexibleSections(input, inventory, ranked))
-  const fields = { ...generatedFields(input, inventory, sections), sections, normalFailure }
-  const batch: GeneratedAdaptiveBatch | GeneratedRemainderBatch = fields.total < NORMAL_QUESTION_COUNT
-    ? Object.freeze({ ...fields, kind: 'FINAL_REMAINDER_BATCH', batchMode: 'FINAL_REMAINDER' })
+  const limit = final ? selected.eligibleIds.length : NORMAL_QUESTION_COUNT
+  const sections = snapshotSections(flexibleSections(input, selected, ranked, limit))
+  const fields = { ...generatedFields(input, selected, sections), sections, normalFailure }
+  const deferred = new Set(selected.eligibleQuestions.filter(({ finalOnly }) => finalOnly).map(({ sourceId }) => sourceId))
+  const finalOnlySourceIds = Object.freeze(fields.sourceIds.filter((id) => deferred.has(id)))
+  const batch: GeneratedAdaptiveBatch | GeneratedRemainderBatch = final
+    ? Object.freeze({ ...fields, kind: 'FINAL_REMAINDER_BATCH', batchMode: 'FINAL_REMAINDER',
+        ...(finalOnlySourceIds.length ? { finalOnlySourceIds } : {}) })
     : Object.freeze({ ...fields, kind: 'ADAPTIVE_BATCH', batchMode: 'ADAPTIVE' })
   return {
     ok: true,

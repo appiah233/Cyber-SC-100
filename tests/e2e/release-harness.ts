@@ -14,9 +14,9 @@ const source = fileURLToPath(new URL('../fixtures/release-browser-source.ts', im
 const cycleRunner = fileURLToPath(new URL('../../src/integration/CycleJourney.tsx', import.meta.url))
 const mime: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8' }
 
-export async function releaseHarness() {
+export async function releaseHarness({ wideFinal = false } = {}) {
   const buildResult = await build({
-    base: releaseBase, logLevel: 'silent', build: { write: false },
+    base: releaseBase, define: { __QA_RELEASE_WIDE_FINAL__: JSON.stringify(wideFinal) }, logLevel: 'silent', build: { write: false },
     plugins: [{
       name: 'qa-release-cycle-source', enforce: 'pre',
       transform(code, path) {

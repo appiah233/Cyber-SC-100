@@ -115,7 +115,7 @@ for (const [fixture, size] of [['standard-59', 59], ['standard-41', 41], ['singl
     await expect(main(page)).toContainText(size + (size === 1 ? ' question · 1 section' : ' questions · 1 section'))
     await expect(outline(page).getByRole('listitem')).toHaveCount(1)
     await expect(outline(page)).not.toContainText(/Case Study|Interactive Questions/)
-    if (size < 59) await expect(main(page).getByRole('heading', { name: 'Final Examination Batch', exact: true })).toBeVisible()
+    if (size < 59) await expect(main(page).getByRole('heading', { name: 'Final Exam', exact: true })).toBeVisible()
     await start(page)
     await section(page, 'Standard Questions', 1, size, size)
     await choose(page)
@@ -141,7 +141,7 @@ for (const [fixture, size] of [['standard-59', 59], ['standard-41', 41], ['singl
 
 test('candidate actual entry: two remaining case children, 20 standard and one interactive retain separate locks and actual counts', async ({ page, context }) => {
   await open(page, 'partial-23')
-  await expect(main(page).getByRole('heading', { name: 'Final Examination Batch' })).toBeVisible()
+  await expect(main(page).getByRole('heading', { name: 'Final Exam' })).toBeVisible()
   await expect(main(page)).toContainText('23 questions · 3 sections')
   await expect(outline(page).getByRole('listitem')).toHaveCount(3)
   await expect(outline(page)).not.toContainText(/Case Study 1|Case Study 2/)

@@ -366,6 +366,26 @@ a { color: var(--accent); }
   align-content: center;
 }
 .case-body, .navigator-content { border-block-start: 1px solid var(--edge); padding-block-start: .625rem; }
+.navigator-position {
+  display: grid;
+  gap: .2rem;
+  border-block-end: 1px solid var(--edge);
+  padding-block-end: .55rem;
+  margin-block-end: .55rem;
+}
+.navigator-exam-position {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: .2rem .5rem;
+}
+.navigator-exam-position strong {
+  color: var(--ink);
+  font-size: .9rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 .case-body { max-block-size: min(66dvh, 38rem); overflow: auto; overscroll-behavior-block: contain; padding-inline-end: .35rem; }
 .case-body h2 { margin-block: .1rem .55rem; font-size: 1.125rem; color: var(--ink); }
 .case-body .context-section { margin-block-start: .85rem; padding-block-start: .75rem; border-block-start: 1px solid var(--edge); }

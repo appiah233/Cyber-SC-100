@@ -3,9 +3,18 @@ import type { FoundationQuestion } from '../../src/app/App'
 import type { GeneratedBatch } from '../../src/domain/batch-engine'
 import { adaptivePool, choiceOptionIds } from './adaptive-pool'
 
+declare const __QA_RELEASE_WIDE_FINAL__: boolean
+const wideFinal = __QA_RELEASE_WIDE_FINAL__
+
 export const releaseTestJourney = 'qa-release-browser'
 export const releaseTestDatabase = 'qa-release-browser-store'
-export const releaseTestEligible = adaptivePool({ families: [3, 3], standard: 131, interactive: 4 })
+const pool = adaptivePool({ families: [3, 3], standard: wideFinal ? 111 : 131, interactive: 4 })
+export const releaseTestEligible = wideFinal ? {
+  ...pool,
+  questions: pool.questions.map(question => /^qa-standard-10[7-9]$|^qa-standard-11[01]$/.test(question.sourceId)
+    ? { ...question, finalOnly: true }
+    : question),
+} : pool
 const labels = ['Example Alpha', 'Example Beta', 'Example Gamma'] as const
 const options = choiceOptionIds.map((id, index) => ({ id, label: labels[index] }))
 const matchingTargets = ['North destination', 'South destination'].map((label, index) => ({
@@ -40,7 +49,7 @@ export function releaseTestSourceFor(batch: GeneratedBatch) {
     examDurationMinutes: 2,
     timerWarningMinutes: [1],
     scoring: {
-      policy: { scoringVersion: 'qa-release-score-v1', passingPercentage: 75, postExamReviewPolicy: 'NONE' as const },
+      policy: { scoringVersion: wideFinal ? 'qa-release-score-v2' : 'qa-release-score-v1', passingPercentage: wideFinal ? 90 : 75, postExamReviewPolicy: 'NONE' as const },
       loadBank: async () => {
         const state = globalThis as typeof globalThis & { __qaReleaseScoringInvocations?: number }
         state.__qaReleaseScoringInvocations = (state.__qaReleaseScoringInvocations ?? 0) + 1

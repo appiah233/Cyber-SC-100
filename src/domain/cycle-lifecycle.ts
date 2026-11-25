@@ -132,7 +132,7 @@ const interactionKinds = new Set([
 
 const normalFailures = new Set([
   'CASE_STUDY_CHILDREN_EXHAUSTED', 'STANDARD_POOL_INSUFFICIENT', 'INTERACTIVE_POOL_EXHAUSTED',
-  'MULTIPLE_CONSTRAINTS_EXHAUSTED', 'CROSS_SECTION_ALLOCATION_UNSATISFIABLE',
+  'MULTIPLE_CONSTRAINTS_EXHAUSTED', 'CROSS_SECTION_ALLOCATION_UNSATISFIABLE', 'FINAL_ONLY_SOURCE_REMAINDER',
 ])
 
 const additiveMetadata = [
@@ -175,6 +175,13 @@ function validBatch(value: unknown, allowLegacy = false): value is GeneratedBatc
       || !validateExamBatch(value as unknown as GeneratedBatch).ok) return false
     if (value.kind !== 'NORMAL_BATCH'
       && (typeof value.normalFailure !== 'string' || !normalFailures.has(value.normalFailure))) return false
+    if (value.finalOnlySourceIds !== undefined) {
+      if (value.kind !== 'FINAL_REMAINDER_BATCH' || value.normalFailure !== 'FINAL_ONLY_SOURCE_REMAINDER'
+        || !idList(value.finalOnlySourceIds) || !value.finalOnlySourceIds.length
+        || value.sourceIds.length - value.finalOnlySourceIds.length > NORMAL_QUESTION_COUNT
+        || value.finalOnlySourceIds.some(id => !source.has(id))) return false
+    } else if (value.kind === 'FINAL_REMAINDER_BATCH'
+      && (value.sourceIds.length >= NORMAL_QUESTION_COUNT || value.normalFailure === 'FINAL_ONLY_SOURCE_REMAINDER')) return false
     const count = (kind: string) => (value as unknown as GeneratedBatch).sections.reduce((n, section) =>
       n + (section.kind === kind ? section.questionIds.length : 0), 0)
     if (value.caseStudyQuestionCount !== count('CASE_STUDY_1') + count('CASE_STUDY_2') + count('REMAINDER_CASE_STUDY')

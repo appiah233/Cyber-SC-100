@@ -81,7 +81,7 @@ async function main() {
 try {
   await main()
 } catch (error) {
-  const code = error instanceof Error && /^RELEASE_[A-Z_]+$/.test(error.message)
+  const code = error instanceof Error && /^RELEASE_[A-Z0-9_]+$/.test(error.message)
     ? error.message : 'RELEASE_PRIVATE_INPUT_OR_IO_ERROR'
   console.error(code + ': no source data printed.')
   process.exitCode = 1

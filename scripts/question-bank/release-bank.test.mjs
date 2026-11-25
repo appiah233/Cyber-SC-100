@@ -89,3 +89,56 @@ describe('protected release policy gates (synthetic source only)', () => {
     assert.throws(() => reviewReleaseInteraction({ kind: 'IMAGE_HOTSPOT' }, 'Synthetic unsupported type.', []), /RELEASE_INTERACTION_UNSUPPORTED/)
   })
 })
+
+describe('owner correction for documented source-limitations (synthetic candidate data)', () => {
+  it('keeps independent case-based holds when provenance/role do not match the audited source', () => {
+    for (const [sourceId, page, caseStudyId] of [
+      ['Q6', 7, 'CS-FABRIKAM'], ['Q209', 207, 'CS-FRONT-DOOR'], ['Q211', 209, 'CS-FRONT-DOOR'],
+    ]) {
+      const base = record(sourceId)
+      const family = { id: caseStudyId, heldChildIds: [sourceId], rejectedChildIds: [], validatedChildIds: [], scenarioText: 'Synthesized test scenario only.' }
+      const item = { ...base, family, question: { ...base.question, sourcePage: page, caseStudyId }, row: { ...base.row, SourcePage: page } }
+      assert.equal(reviewReleaseRecord(item).classification, 'ELIGIBLE_WITH_SOURCE_LIMITATION')
+      assert.deepEqual(reviewReleaseRecord(item).projected.shown.options, options)
+      assert.equal(reviewReleaseRecord({ ...item, family: { ...family, id: 'another-test-family' } }).classification, 'REVIEW_HOLD')
+      assert.equal(reviewReleaseRecord({ ...item, family: { ...family, heldChildIds: [] } }).classification, 'REVIEW_HOLD')
+    }
+  })
+
+  it('does not generate alternative keys for an authored ambiguous sequence', () => {
+    const base = record('Q58')
+    const positionIds = ['pos-a', 'pos-b']
+    const positions = positionIds.map((id, i) => ({ id, label: 'Position ' + (i + 1) }))
+    const printed = [{ targetId: 'pos-a', optionId: 'third-choice' }, { targetId: 'pos-b', optionId: 'first-choice' }]
+    const interaction = { kind: 'ORDERING', positions, items: options }
+    const prompt = 'Place the items in correct order. More than one can work.'
+    const item = { ...base, prompt, mapping: printed, row: { ...base.row, SourcePage: 58 },
+      question: { ...base.question, sourcePage: 58, interaction },
+      answer: { ...base.answer, normalizedMappingDigest: digest(printed) } }
+    const reviewed = reviewReleaseRecord(item)
+    assert.equal(reviewed.classification, 'ELIGIBLE_WITH_SOURCE_LIMITATION')
+    assert.deepEqual(reviewed.projected.answer, { kind: 'ORDERING', optionIds: ['third-choice', 'first-choice'] })
+    assert.deepEqual(reviewed.projected.shown, interaction)
+    assert.throws(() => reviewReleaseInteraction(interaction, prompt, printed), /RELEASE_ORDERING_INSTRUCTION_REVIEW_REQUIRED/)
+  })
+
+  it('will not substitute another image or invent geometry for the source dropdown raster', () => {
+    const base = record('Q360')
+    const raster = { sourceQuestionId: 'Q360', sourcePage: 358, sourceXref: 1466,
+      path: 'assets/sc100-x1466-d389f9dbde5466e0.png',
+      checksum: 'd389f9dbde5466e02a501a07dcaaec809ad7855635ed728142a898ac902c1747',
+      reviewStatus: 'SOURCE_INTERACTION_REVIEW_REQUIRED' }
+    const targets = ['d1', 'd2'].map(id => ({ id, label: 'Fixture ' + id, options: options.map(option => ({ ...option, id: id + ':' + option.id })) }))
+    const mapping = targets.map(t => ({ targetId: t.id, optionId: t.options[0].id }))
+    const question = { ...base.question, sourcePage: 358, interactionValidated: false, interaction: { kind: 'DROPDOWN', targets } }
+    const item = { ...base, question, mapping, row: { ...base.row, SourcePage: 358 },
+      answer: { ...base.answer, normalizedMappingDigest: digest(mapping) }, assetsForQuestion: [raster] }
+    const final = reviewReleaseRecord(item)
+    assert.equal(final.classification, 'ELIGIBLE_WITH_SOURCE_LIMITATION')
+    assert.deepEqual(final.projected.shown, question.interaction)
+    assert.deepEqual(final.approvedAssets, [raster])
+    assert.equal(reviewReleaseRecord({ ...item, assetsForQuestion: [{ ...raster, checksum: 'wrong' }] }).eligible, false)
+    assert.equal(reviewReleaseRecord({ ...item, assetsForQuestion: [] }).eligible, false)
+    assert.equal(reviewReleaseRecord({ ...item, question: { ...question, interaction: { kind: 'IMAGE_HOTSPOT' } } }).eligible, false)
+  })
+})
