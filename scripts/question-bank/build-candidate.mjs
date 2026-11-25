@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer'
 import { createHash } from 'node:crypto'
 import { chmod, lstat, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
@@ -26,8 +27,29 @@ const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex')
 const projectionId = 'virtual:local-candidate-display'
 const safeCode = { sourcemap: false, minify: true, emptyOutDir: false, copyPublicDir: false, reportCompressedSize: false }
 
+function localExamTiming(env) {
+  const raw = env.EXAM_DURATION_MINUTES
+  const warn = env.EXAM_TIMER_WARNING_MINUTES
+  if (raw === undefined && warn === undefined) return undefined
+  const minutes = value => {
+    if (typeof value !== 'string' || !/^[1-9][0-9]*$/.test(value)) throw new Error('Use configured whole minutes.')
+    const count = Number(value)
+    if (!Number.isSafeInteger(count * 60_000) || count * 60_000 > Number.MAX_SAFE_INTEGER - Date.now()) {
+      throw new Error('The configured exam duration is out of range.')
+    }
+    return count
+  }
+  const examDurationMinutes = minutes(raw)
+  const timerWarningMinutes = warn === undefined ? [] : warn.split(',').map(part => minutes(part.trim()))
+  if (timerWarningMinutes.some(value => value >= examDurationMinutes) || new Set(timerWarningMinutes).size !== timerWarningMinutes.length)
+    throw new Error('Configured warning minutes must be unique and less than the exam duration.')
+  return { examDurationMinutes, timerWarningMinutes }
+}
+
+
 async function main() {
   localOnly()
+  const examTiming = localExamTiming(process.env)
   const [, , input, output, ...extra] = process.argv
   if (!input || !output || extra.length) throw new Error('Supply an external approved bank directory and a new external output directory.')
   const bankDir = await realpath(resolve(input))
@@ -58,8 +80,30 @@ async function main() {
       },
     })
     const { prepareCandidateReference } = await import(pathToFileURL(join(projectionBuild, 'projection.mjs')).href)
-    const payload = prepareCandidateReference(bank, display, reference, version)
-    const serialized = JSON.stringify(payload)
+    const { assetFiles, ...payload } = prepareCandidateReference(bank, display, reference, version)
+    const exhibitSources = new Map()
+    let rasterBytes = 0
+    for (const { id, path, checksum } of assetFiles) {
+      if (!/^assets\/[A-Za-z0-9][\w-]{0,95}\.png$/.test(path)) throw new Error('Invalid approved exhibit path.')
+      const assetPath = join(bankDir, path)
+      const stat = await lstat(assetPath)
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 2 * 1024 * 1024 || assetPath !== await realpath(assetPath))
+        throw new Error('Unverifiable approved exhibit file.')
+      const bytes = await readFile(assetPath)
+      const pngSignature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
+      if (!bytes.subarray(0, 8).equals(pngSignature) || sha256(bytes) !== checksum) throw new Error('Approved exhibit digest mismatch.')
+      rasterBytes += bytes.byteLength
+      if (rasterBytes > 2 * 1024 * 1024) throw new Error('Approved local exhibit budget exceeded.')
+      exhibitSources.set(id, 'data:image/png;base64,' + bytes.toString('base64'))
+    }
+    for (const item of [...Object.values(payload.questions), ...Object.values(payload.contexts)]) {
+      for (const asset of item.assets ?? []) {
+        const src = exhibitSources.get(asset.id)
+        if (!src) throw new Error('Unresolved approved exhibit.')
+        asset.src = src
+      }
+    }
+    const serialized = JSON.stringify({ ...payload, ...(examTiming ? { examTiming } : {}) })
     if (/"(?:rawAnswer|rawExplanation|answerDefinitions|sourceAnswer|expectedAnswer|score|passThreshold|sourceDocumentChecksum)"/i.test(serialized)) {
       throw new Error('Unexpected non-display data.')
     }
@@ -94,7 +138,7 @@ async function main() {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex,nofollow">
 <meta name="referrer" content="no-referrer">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob:; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; form-action 'none'">
 <title>Examination Hub | Local SC-100 practice</title>
 <link rel="stylesheet" href="./candidate.css">
 <script type="module" src="./candidate.js"></script>

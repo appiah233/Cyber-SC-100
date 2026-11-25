@@ -1,14 +1,17 @@
 import { NORMAL_QUESTION_COUNT, NORMAL_SECTIONS } from './model'
+import { examExpirationAt, isExamTimestamp } from './exam-timer'
 import type {
   AttemptStatus,
   CandidateAnswer,
   CandidateInteractionAnswer,
   ExamAttempt,
   ExamBatch,
+  ExamFinalizationReason,
   ExamResult,
   ExamSection,
   ExamSectionKey,
   ExamSectionKind,
+  FinalizedAnswerSnapshot,
   SourceQuestionId,
 } from './model'
 
@@ -30,6 +33,9 @@ type TransitionFailure =
   | 'INVALID_ANSWER'
   | 'INVALID_RESULT'
   | 'INVALID_TIMESTAMP'
+  | 'INVALID_DURATION'
+  | 'TIME_EXPIRED'
+  | 'DEADLINE_NOT_REACHED'
 
 export type TransitionResult =
   | { readonly ok: true; readonly attempt: ExamAttempt }
@@ -38,7 +44,9 @@ export type TransitionResult =
 export type AttemptEvent = {
   readonly at?: number
 } & (
-  | { readonly type: 'PREPARE' | 'START_SECTION' | 'OPEN_FINAL_REVIEW' | 'FINAL_SUBMIT' }
+  | { readonly type: 'PREPARE' | 'OPEN_FINAL_REVIEW' | 'FINAL_SUBMIT' | 'END_EXAM' }
+  | { readonly type: 'START_SECTION'; readonly durationMinutes?: number }
+  | { readonly type: 'TIME_EXPIRED'; readonly at: number }
   | { readonly type: 'NAVIGATE'; readonly position: number }
   | { readonly type: 'SAVE_ANSWER'; readonly questionId: SourceQuestionId; readonly answer: CandidateAnswer | null }
   | { readonly type: 'TOGGLE_REVIEW'; readonly questionId: SourceQuestionId }
@@ -80,7 +88,7 @@ function id(value: unknown): value is string {
 }
 
 function isTimestamp(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+  return isExamTimestamp(value)
 }
 
 function listOfIds(value: unknown): value is readonly string[] {
@@ -278,6 +286,32 @@ function copyAnswer(answer: CandidateAnswer): CandidateAnswer {
   return copyInteractionAnswer(answer)
 }
 
+function finalizedAnswers(attempt: ExamAttempt, submittedAt: number, reason: ExamFinalizationReason): FinalizedAnswerSnapshot {
+  const answers = Object.freeze(Object.fromEntries(Object.entries(attempt.answers).map(([key, answer]) => [key, copyAnswer(answer!)])))
+  return Object.freeze({
+    attemptId: attempt.id,
+    cycleId: attempt.cycleId,
+    batchId: attempt.batch.id,
+    contentVersion: attempt.contentVersion,
+    questionIds: Object.freeze(attempt.batch.sections.flatMap(section => section.questionIds)),
+    submittedAt,
+    reason,
+    answers,
+  })
+}
+
+function samePlain(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left) && Array.isArray(right) && left.length === right.length
+      && Array.from(left).every((item, index) => samePlain(item, right[index]))
+  }
+  if (!record(left) || !record(right)) return false
+  const entries = Object.entries(left)
+  return entries.length === Object.keys(right).length
+    && entries.every(([key, item]) => Object.hasOwn(right, key) && samePlain(item, right[key]))
+}
+
 function validResult(result: unknown, actualQuestionCount: number): result is ExamResult {
   return record(result)
     && typeof result.questionCount === 'number' && Number.isInteger(result.questionCount)
@@ -306,7 +340,7 @@ export function transitionAttempt(attempt: ExamAttempt, event: AttemptEvent): Tr
       ...attempt,
       ...patch,
       revision: attempt.revision + 1,
-      updatedAt: event.at ?? attempt.updatedAt,
+      updatedAt: event.at === undefined ? attempt.updatedAt : Math.max(event.at, attempt.updatedAt ?? 0),
     }),
   })
   const sections = attempt.batch.sections
@@ -316,6 +350,18 @@ export function transitionAttempt(attempt: ExamAttempt, event: AttemptEvent): Tr
   const section = stage && nextSection && validLocks && attempt.status === stage.progress
     && attempt.activeSection === examSectionKey(nextSection) ? nextSection : undefined
   const boundary = validLocks && atSubmittedSectionBoundary(attempt)
+  const timed = typeof attempt.expiresAt === 'number'
+  const isTerminal = attempt.status === 'SUBMITTED' || attempt.status === 'SCORED'
+  const terminalEvent = event.type === 'END_EXAM' || event.type === 'FINAL_SUBMIT' || event.type === 'TIME_EXPIRED'
+  if (isTerminal && terminalEvent) return { ok: true, attempt }
+  // The caller supplies the *accepted* action time, not the delayed write time.
+  // Once the cutoff is reached ordinary edits cannot be accepted in this domain.
+  if (timed && !isTerminal) {
+    if (event.at === undefined || (typeof attempt.startedAt === 'number' && event.at < attempt.startedAt)) {
+      return fail('INVALID_TIMESTAMP')
+    }
+    if (!terminalEvent && event.at >= attempt.expiresAt!) return fail('TIME_EXPIRED')
+  }
 
   switch (event.type) {
     case 'PREPARE':
@@ -325,7 +371,18 @@ export function transitionAttempt(attempt: ExamAttempt, event: AttemptEvent): Tr
         || (attempt.locks.length === 0 ? attempt.status !== 'READY' : !boundary)) {
         return fail('INVALID_TRANSITION')
       }
-      return next({ status: stage.progress, activeSection: examSectionKey(nextSection), position: 0 })
+      const initial = attempt.locks.length === 0
+      const { durationMinutes } = event
+      if (!initial && durationMinutes !== undefined) return fail('INVALID_DURATION')
+      if (durationMinutes !== undefined && event.at === undefined) return fail('INVALID_TIMESTAMP')
+      const expiresAt = durationMinutes === undefined ? null : examExpirationAt(event.at!, durationMinutes)
+      if (durationMinutes !== undefined && expiresAt === null) return fail('INVALID_DURATION')
+      return next({
+        status: stage.progress,
+        activeSection: examSectionKey(nextSection),
+        position: 0,
+        ...(initial && event.at !== undefined ? { startedAt: event.at, expiresAt } : {}),
+      })
     }
     case 'NAVIGATE':
       if (!section) return fail('INVALID_TRANSITION')
@@ -364,12 +421,32 @@ export function transitionAttempt(attempt: ExamAttempt, event: AttemptEvent): Tr
         ? next({ status: 'FINAL_SUBMISSION_PENDING' })
         : fail('INVALID_TRANSITION')
     case 'FINAL_SUBMIT':
-      if (attempt.status === 'SUBMITTED' || attempt.status === 'SCORED') return { ok: true, attempt }
-      return attempt.status === 'FINAL_SUBMISSION_PENDING' && validLocks && !nextSection && attempt.activeSection === null
-        ? next({ status: 'SUBMITTED', submittedAt: event.at ?? attempt.updatedAt })
-        : fail('INVALID_TRANSITION')
+    case 'END_EXAM':
+    case 'TIME_EXPIRED': {
+      const finalReview = attempt.status === 'FINAL_SUBMISSION_PENDING' && validLocks && !nextSection && attempt.activeSection === null
+      if (event.type === 'FINAL_SUBMIT' ? !finalReview : !section && !boundary && !finalReview) {
+        return fail('INVALID_TRANSITION')
+      }
+      const at = event.at ?? attempt.updatedAt
+      if (!isTimestamp(at)) return fail('INVALID_TIMESTAMP')
+      const expired = timed && at >= attempt.expiresAt!
+      if (event.type === 'TIME_EXPIRED' && !expired) return fail('DEADLINE_NOT_REACHED')
+      const reason: ExamFinalizationReason = expired ? 'TIME_EXPIRED' : 'MANUAL_SUBMISSION'
+      const finalSnapshot = finalizedAnswers(attempt, at, reason)
+      return next({
+        status: 'SUBMITTED',
+        activeSection: null,
+        position: 0,
+        locks: Object.freeze(sections.map(examSectionKey)),
+        answers: finalSnapshot.answers,
+        submittedAt: at,
+        finalizationReason: reason,
+        finalizedAnswerSnapshot: finalSnapshot,
+      })
+    }
     case 'RECORD_RESULT':
       if (attempt.status !== 'SUBMITTED') return fail('INVALID_TRANSITION')
+      if (!getFinalizedAnswerSnapshot(attempt)) return fail('INVALID_TRANSITION')
       if (!validResult(event.result, sections.reduce((count, item) => count + item.questionIds.length, 0))) return fail('INVALID_RESULT')
       return next({
         status: 'SCORED',
@@ -415,6 +492,29 @@ export function isAttemptSnapshot(value: unknown): value is ExamAttempt {
   if (!progress && !submitted && !isFinal && !beforeStart) return false
   if ((isFinal && lockCount !== sections.length) || (beforeStart && lockCount !== 0)) return false
   if (!isSubmitted && value.submittedAt !== null) return false
+  // Legacy untimed attempts omit both fields. Do not create a deadline from the
+  // currently loaded configuration when resuming a started legacy attempt.
+  const { startedAt, expiresAt, finalizationReason, finalizedAnswerSnapshot } = value
+  if (startedAt !== undefined || expiresAt !== undefined) {
+    if ((startedAt !== null && !isTimestamp(startedAt)) || (expiresAt !== null && !isTimestamp(expiresAt))) return false
+    if (beforeStart && (startedAt !== null || expiresAt !== null)) return false
+    if (!beforeStart && !isTimestamp(startedAt)) return false
+    if (isTimestamp(startedAt) && (!isTimestamp(value.updatedAt) || value.updatedAt < startedAt)) return false
+    if (isTimestamp(expiresAt) && (!isTimestamp(startedAt) || expiresAt <= startedAt)) return false
+    if (isTimestamp(expiresAt) && !isSubmitted && isTimestamp(value.updatedAt) && value.updatedAt >= expiresAt) return false
+  }
+  if (isSubmitted) {
+    if (finalizationReason !== undefined || finalizedAnswerSnapshot !== undefined || startedAt !== undefined) {
+      if (!isTimestamp(value.submittedAt) || !isTimestamp(value.updatedAt) || value.updatedAt < value.submittedAt
+        || (isTimestamp(startedAt) && value.submittedAt < startedAt)
+        || (finalizationReason !== 'MANUAL_SUBMISSION' && finalizationReason !== 'TIME_EXPIRED')
+        || (isTimestamp(expiresAt) && value.submittedAt >= expiresAt ? 'TIME_EXPIRED' : 'MANUAL_SUBMISSION') !== finalizationReason
+        || !samePlain(finalizedAnswerSnapshot, finalizedAnswers(value as unknown as ExamAttempt, value.submittedAt, finalizationReason))) {
+        return false
+      }
+    }
+  } else if ((finalizationReason !== undefined && finalizationReason !== null)
+    || (finalizedAnswerSnapshot !== undefined && finalizedAnswerSnapshot !== null)) return false
   const actualQuestionCount = sections.reduce((count, item) => count + item.questionIds.length, 0)
   if (value.status === 'SCORED' ? !validResult(value.result, actualQuestionCount) : value.result !== null) return false
   // Previous/current sections may have content; later sections may not.
@@ -424,4 +524,22 @@ export function isAttemptSnapshot(value: unknown): value is ExamAttempt {
   return progress
     ? value.activeSection === examSectionKey(current) && value.position < current.questionIds.length
     : value.activeSection === null && value.position === 0
+}
+
+/** Restore the frozen terminal projection after structured-clone storage; old
+ * timestamped submitted attempts are provably manual and can be upgraded
+ * without applying new timer configuration or reopening their locks. */
+export function restoreAttemptFinalization(attempt: ExamAttempt): ExamAttempt {
+  if (!isAttemptSnapshot(attempt) || (attempt.status !== 'SUBMITTED' && attempt.status !== 'SCORED')
+    || !isTimestamp(attempt.submittedAt) || !isTimestamp(attempt.updatedAt) || attempt.updatedAt < attempt.submittedAt) return attempt
+  const reason = attempt.finalizationReason ?? 'MANUAL_SUBMISSION'
+  const snapshot = finalizedAnswers(attempt, attempt.submittedAt, reason)
+  return Object.freeze({ ...attempt, answers: snapshot.answers, finalizationReason: reason, finalizedAnswerSnapshot: snapshot })
+}
+
+/** This is an input gate for a future scorer, not a scoring implementation. */
+export function getFinalizedAnswerSnapshot(attempt: ExamAttempt): FinalizedAnswerSnapshot | null {
+  if (!isAttemptSnapshot(attempt) || (attempt.status !== 'SUBMITTED' && attempt.status !== 'SCORED')
+    || !attempt.finalizationReason || !isTimestamp(attempt.submittedAt)) return null
+  return finalizedAnswers(attempt, attempt.submittedAt, attempt.finalizationReason)
 }

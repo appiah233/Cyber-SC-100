@@ -178,6 +178,20 @@ export interface ExamResult {
   readonly scoringPolicyVersion?: string
 }
 
+export type ExamFinalizationReason = 'MANUAL_SUBMISSION' | 'TIME_EXPIRED'
+
+/** Candidate data only. Missing answers are left absent, never manufactured. */
+export interface FinalizedAnswerSnapshot {
+  readonly attemptId: string
+  readonly cycleId: string
+  readonly batchId: string
+  readonly contentVersion: ContentVersion
+  readonly questionIds: readonly SourceQuestionId[]
+  readonly submittedAt: number
+  readonly reason: ExamFinalizationReason
+  readonly answers: Readonly<Partial<Record<SourceQuestionId, CandidateAnswer>>>
+}
+
 export type AttemptStatus =
   | 'CREATED' | 'READY'
   | 'CASE_STUDY_1_IN_PROGRESS' | 'CASE_STUDY_1_SUBMITTED'
@@ -203,5 +217,10 @@ export interface ExamAttempt {
   readonly optionOrder: Readonly<Partial<Record<SourceQuestionId, readonly OptionId[]>>>
   readonly updatedAt: number | null
   readonly submittedAt: number | null
+  /** Undefined is the validated pre-timer, untimed storage format. */
+  readonly startedAt?: number | null
+  readonly expiresAt?: number | null
+  readonly finalizationReason?: ExamFinalizationReason | null
+  readonly finalizedAnswerSnapshot?: FinalizedAnswerSnapshot | null
   readonly result: ExamResult | null
 }

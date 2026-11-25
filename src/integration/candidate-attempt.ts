@@ -1,10 +1,10 @@
 import type { FoundationAction, FoundationPreview, FoundationQuestion } from '../app/App'
-import { atSubmittedSectionBoundary, createAttempt, examSectionKey, isAttemptSnapshot, nextExistingSection, transitionAttempt } from '../domain'
+import { atSubmittedSectionBoundary, createAttempt, examSectionKey, isAttemptSnapshot, nextExistingSection, restoreAttemptFinalization, transitionAttempt } from '../domain'
 import type { AttemptEvent, ExamAttempt } from '../domain'
 import type { GeneratedBatch } from '../domain/batch-engine'
 import { activeExamCycle, createCycleLifecycle, isCycleLifecycle, transitionCycleLifecycle } from '../domain/cycle-lifecycle'
 import type { CycleLifecycle } from '../domain/cycle-lifecycle'
-import { isCandidateAnswerFor, toCandidateAnswer } from '../features/exam/question-response'
+import { isCandidateAnswerFor, readDisplayResponse, responseState, toCandidateAnswer } from '../features/exam/question-response'
 
 export interface FoundationSource {
   readonly attemptId: string
@@ -15,6 +15,8 @@ export interface FoundationSource {
   readonly examTitle?: string
   readonly synthetic?: boolean
   readonly contentNotice?: string
+  readonly examDurationMinutes?: number
+  readonly timerWarningMinutes?: readonly number[]
   /** Optional complete eligibility universe from a separately verified inventory. */
   readonly eligibleSourceIds?: readonly string[]
 }
@@ -73,7 +75,7 @@ function withCursor(attempt: ExamAttempt, view: CandidateSnapshot['candidateView
 /** The guarded numeric position is authoritative. The optional human-readable
  * cursor is derived from it, never trusted to resolve into a submitted section. */
 export function restoreCandidateCursor(attempt: CandidateSnapshot): CandidateSnapshot {
-  return withCursor(attempt, attempt.candidateView === 'review' ? 'review' : 'question')
+  return withCursor(restoreAttemptFinalization(attempt), attempt.candidateView === 'review' ? 'review' : 'question')
 }
 
 export function initialCandidate(source: FoundationSource, at: number): { attempt: CandidateSnapshot; cycle: CandidateCycle } {
@@ -137,8 +139,8 @@ export function candidateValidators(source: FoundationSource) {
   }
 }
 
-type CandidateEdit = Exclude<FoundationAction, { type: 'TAKE_OVER' | 'RETRY_SAVE' | 'DISCARD_UNSAVED' }>
-type CandidateChange = { readonly attempt: CandidateSnapshot; readonly cycle: CandidateCycle }
+export type CandidateEdit = Exclude<FoundationAction, { type: 'TAKE_OVER' | 'RETRY_SAVE' | 'DISCARD_UNSAVED' }>
+export type CandidateChange = { readonly attempt: CandidateSnapshot; readonly cycle: CandidateCycle }
 
 export function isRecoveryAction(action: FoundationAction): action is Exclude<FoundationAction, CandidateEdit> {
   return action.type === 'TAKE_OVER' || action.type === 'RETRY_SAVE' || action.type === 'DISCARD_UNSAVED'
@@ -150,16 +152,23 @@ export function candidateChange(
   previous: CandidateSnapshot,
   cycle: CandidateCycle,
   source: FoundationSource,
-  action: CandidateEdit | { type: 'RESUME_BOUNDARY' },
+  action: CandidateEdit | { type: 'RESUME_BOUNDARY' | 'TIME_EXPIRED' },
   at: number,
 ): CandidateChange | null {
-  if (previous.status === 'SUBMITTED' || previous.revision >= Number.MAX_SAFE_INTEGER) return null
+  if (previous.status === 'SUBMITTED' || previous.revision >= Number.MAX_SAFE_INTEGER
+    || !Number.isFinite(at) || at < 0) return null
+  // Use the actual accepted timestamp, not when IndexedDB eventually commits.
+  // The session serializes acceptance and never calls this seam with wall time
+  // retroactively for an existing edit.
+  const pastDeadline = typeof previous.expiresAt === 'number' && at >= previous.expiresAt
+  if (pastDeadline && action.type !== 'TIME_EXPIRED' && action.type !== 'FINAL_SUBMIT' && action.type !== 'END_EXAM') return null
   const now = Math.max(at, previous.updatedAt ?? 0, cycle.lifecycle.updatedAt)
   let attempt: ExamAttempt = previous
   let nextCycle = cycle
   let view = previous.candidateView
   const apply = (event: AttemptEvent) => {
-    const moved = transitionAttempt(attempt, { ...event, at: now })
+    const firstStart = action.type === 'START'
+    const moved = transitionAttempt(attempt, { ...event, at: firstStart ? now : at })
     if (!moved.ok) return false
     attempt = moved.attempt
     return true
@@ -181,7 +190,7 @@ export function candidateChange(
     case 'START':
       if (previous.status !== 'CREATED' && previous.status !== 'READY') return null
       if ((previous.status === 'CREATED' && !apply({ type: 'PREPARE' }))
-        || !apply({ type: 'START_SECTION' }) || !track('START')) return null
+        || !apply({ type: 'START_SECTION', durationMinutes: source.examDurationMinutes }) || !track('START')) return null
       break
     case 'NAVIGATE':
       if (!apply({ type: 'NAVIGATE', position: action.position })) return null
@@ -208,7 +217,10 @@ export function candidateChange(
       if (!continueAfterSubmit()) return null
       break
     case 'FINAL_SUBMIT':
-      if (!apply({ type: 'FINAL_SUBMIT' }) || !track('COMPLETE')) return null
+    case 'END_EXAM':
+    case 'TIME_EXPIRED':
+      if (!apply({ type: action.type, at: now }) || !track('COMPLETE')) return null
+      view = 'question'
       if (source.eligibleSourceIds?.length) {
         const active = activeExamCycle(nextCycle.lifecycle)
         const universe = new Set(source.eligibleSourceIds)
@@ -235,4 +247,16 @@ export function candidateChange(
 
 export function atIntermediateBoundary(attempt: CandidateSnapshot): boolean {
   return atSubmittedSectionBoundary(attempt)
+}
+
+/** Completeness only; never evaluates or projects correct answers. */
+export function candidateExamSummary(source: FoundationSource, attempt: CandidateSnapshot) {
+  const answered = Object.entries(attempt.answers).filter(([id, answer]) => {
+    const { interaction } = candidateQuestion(source, id)
+    return responseState(interaction, readDisplayResponse(interaction, answer)) === 'ANSWERED'
+  }).length
+  return {
+    unanswered: source.batch.sourceIds.length - answered,
+    marked: Object.values(attempt.reviewMarks).filter((mark) => mark === true).length,
+  }
 }

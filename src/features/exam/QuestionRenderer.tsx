@@ -1,43 +1,21 @@
-import { Component, useId, useState } from 'react'
+import { Component, useId } from 'react'
 import type { ComponentType, ReactNode } from 'react'
 import { Button, Select } from '../../design-system/primitives'
 
-export interface DisplayOption {
-  readonly id: string
-  readonly label: string
-}
+import { MatchingInteraction, OrderingInteraction } from './PlacementInteractions'
+import { getTargetSelection } from './interaction-types'
+import type { DisplayInteraction, DisplayTarget, RendererProps } from './interaction-types'
+import { applyTargetChange, isSupportedDiagram } from './question-response'
 
-export interface DisplayTarget {
-  readonly id: string
-  readonly label: string
-  readonly options: readonly DisplayOption[]
-}
+export type {
+  AnswerableDisplayInteraction, DisplayInteraction, DisplayOption, DisplayResponse, DisplayTarget,
+} from './interaction-types'
 
-type ChoiceKind = 'SINGLE_CHOICE' | 'MULTIPLE_CHOICE'
-type TargetKind = 'DROPDOWN' | 'DROPDOWN_HOTSPOT' | 'MATCHING' | 'DRAG_DROP' | 'STATEMENT'
-export type DisplayInteraction =
-  | { readonly kind: ChoiceKind; readonly options: readonly DisplayOption[]; readonly requiredSelections?: number }
-  | { readonly kind: TargetKind; readonly targets: readonly DisplayTarget[] }
-  | { readonly kind: 'ORDERING'; readonly items: readonly DisplayOption[]; readonly positions?: readonly DisplayOption[] }
-  | { readonly kind: 'IMAGE_HOTSPOT' | 'DIAGRAM_DEPENDENT' }
+type ChoicesType = Extract<DisplayInteraction, { readonly kind: 'SINGLE_CHOICE' | 'MULTIPLE_CHOICE' }>
+type DropdownType = Extract<DisplayInteraction, { readonly kind: 'DROPDOWN' | 'DROPDOWN_HOTSPOT' }>
+type StatementType = Extract<DisplayInteraction, { readonly kind: 'STATEMENT' }>
 
-// A display-side response deliberately excludes keys, scoring and source content.
-export interface DisplayResponse {
-  readonly selected?: readonly string[]
-  readonly choiceChange?: { readonly id: string; readonly selected: boolean }
-  readonly targets?: Readonly<Record<string, string>>
-  readonly targetChange?: { readonly id: string; readonly value: string | null }
-  readonly order?: readonly string[]
-}
-
-interface RendererProps<T extends DisplayInteraction> {
-  readonly interaction: T
-  readonly response: DisplayResponse
-  readonly onChange: (response: DisplayResponse) => void
-  readonly disabled?: boolean
-}
-
-function Choices({ interaction, response, onChange, disabled }: RendererProps<Extract<DisplayInteraction, { kind: ChoiceKind }>>) {
+function Choices({ interaction, response, onChange, disabled }: RendererProps<ChoicesType>) {
   const name = useId()
   const progress = useId()
   const multiple = interaction.kind === 'MULTIPLE_CHOICE'
@@ -102,23 +80,23 @@ function TargetField({ target, selected, disabled, onChange }: {
   )
 }
 
-function Targets({ interaction, response, onChange, disabled }: RendererProps<Extract<DisplayInteraction, { kind: TargetKind }>>) {
+function Targets({ interaction, response, onChange, disabled }: RendererProps<DropdownType>) {
   const help = useId()
-  const matching = interaction.kind === 'MATCHING' || interaction.kind === 'DRAG_DROP'
   return (
     <fieldset className="choices target-fields" aria-describedby={help} disabled={disabled}>
-      <legend>{matching ? 'Match the items' : 'Select a response for each field'}</legend>
-      <p id={help}>{matching ? 'Choose a match for each item using the lists. No dragging is required.' : 'Each field has its own list of options.'}</p>
+      <legend>Select a response for each field</legend>
+      <p id={help}>{interaction.kind === 'DROPDOWN_HOTSPOT'
+        ? 'Select a response for each location in the answer area. Each location has its own list of options.'
+        : 'Each field has its own list of options.'}</p>
       {interaction.targets.map((target) => (
         <TargetField
           key={target.id}
           target={target}
-          selected={response.targets?.[target.id] ?? ''}
+          selected={getTargetSelection(response.targets, target.id) ?? ''}
           onChange={(value) => {
-            const next = { ...response.targets }
-            if (value === '') delete next[target.id]
-            else next[target.id] = value
-            onChange({ targets: next, targetChange: { id: target.id, value: value || null } })
+            const change = { id: target.id, value: value || null }
+            const next = applyTargetChange(interaction, response.targets, change)
+            if (next) onChange({ targets: next, targetChange: change })
           }}
           disabled={disabled}
         />
@@ -127,83 +105,35 @@ function Targets({ interaction, response, onChange, disabled }: RendererProps<Ex
   )
 }
 
-function Statements({ interaction, response, onChange, disabled }: RendererProps<Extract<DisplayInteraction, { kind: TargetKind }>>) {
+function Statements({ interaction, response, onChange, disabled }: RendererProps<StatementType>) {
   const name = useId()
+  const update = (id: string, value: string | null) => {
+    const change = { id, value }
+    const next = applyTargetChange(interaction, response.targets, change)
+    if (next) onChange({ targets: next, targetChange: change })
+  }
   return (
     <div className="target-fields">
-      {interaction.targets.map((target) => (
-        <fieldset className="choices" key={target.id} disabled={disabled}>
-          <legend>{target.label}</legend>
-          {target.options.map((option) => (
-            <label className="choice" key={option.id}>
-              <input type="radio" name={name + target.id} value={option.id}
-                checked={response.targets?.[target.id] === option.id}
-                onChange={() => onChange({ targets: { ...response.targets, [target.id]: option.id }, targetChange: { id: target.id, value: option.id } })}
-              />
-              <span>{option.label}</span>
-            </label>
-          ))}
-        </fieldset>
-      ))}
+      <p>Respond to each statement separately.</p>
+      {interaction.targets.map((target) => {
+        const selected = getTargetSelection(response.targets, target.id)
+        return (
+          <fieldset className="choices" key={target.id} disabled={disabled}>
+            <legend>{target.label}</legend>
+            {target.options.map((option) => (
+              <label className="choice" key={option.id}>
+                <input type="radio" name={name + target.id} value={option.id}
+                  checked={selected === option.id}
+                  onChange={() => update(target.id, option.id)}
+                />
+                <span>{option.label}</span>
+              </label>
+            ))}
+            {selected && <Button aria-label={`Clear response for ${target.label}`} onClick={() => update(target.id, null)}>Clear response</Button>}
+          </fieldset>
+        )
+      })}
     </div>
-  )
-}
-
-function Ordering({ interaction, response, onChange, disabled }: RendererProps<Extract<DisplayInteraction, { kind: 'ORDERING' }>>) {
-  const help = useId()
-  const [announcement, announce] = useState('')
-  const original = interaction.items.map(({ id }) => id)
-  const positions = interaction.positions
-  const order = response.order ?? (positions ? [] : original)
-  const available = positions ? interaction.items.filter(({ id }) => !order.includes(id)) : []
-  const labelFor = (id: string) => interaction.items.find((item) => item.id === id)?.label ?? ''
-  const change = (next: readonly string[], message: string) => {
-    onChange({ order: next })
-    announce(message)
-  }
-  const move = (index: number, offset: number) => {
-    const next = [...order]
-    const item = next[index]
-    const other = next[index + offset]
-    if (item === undefined || other === undefined) return
-    next[index] = other
-    next[index + offset] = item
-    change(next, `${labelFor(item)} moved to position ${index + offset + 1}.`)
-  }
-  return (
-    <fieldset className="target-fields choices" aria-describedby={help} disabled={disabled}>
-      <legend>Order the items</legend>
-      <p id={help}>{positions
-        ? `Select ${positions.length} items for the response, then use the move buttons to change their order.`
-        : 'Use the buttons to move items up or down. If the starting order is your response, use the confirmation button below.'}</p>
-      {positions && <Select
-        label={order.length < positions.length ? positions[order.length].label : 'All positions filled'}
-        value=""
-        disabled={disabled || order.length >= positions.length || !available.length}
-        onChange={(event) => {
-          const id = event.currentTarget.value
-          if (id && available.some((item) => item.id === id)) change([...order, id], `${labelFor(id)} added at position ${order.length + 1}.`)
-        }}
-      >
-        <option value="">{order.length < positions.length ? 'Select an item' : 'All positions filled'}</option>
-        {available.map(({ id, label }) => <option key={id} value={id}>{label}</option>)}
-      </Select>}
-      <ol className="ordering" aria-label="Response order">
-        {order.map((id, index) => {
-          const label = labelFor(id)
-          return (
-            <li key={id}>
-              <span>{positions ? `${positions[index]?.label ?? `Position ${index + 1}`}: ` : ''}{label}</span>{' '}
-              <Button disabled={disabled || index === 0} aria-label={`Move ${label} up`} onClick={() => move(index, -1)}>Up</Button>{' '}
-              <Button disabled={disabled || index === order.length - 1} aria-label={`Move ${label} down`} onClick={() => move(index, 1)}>Down</Button>
-              {positions && <>{' '}<Button aria-label={`Remove ${label}`} onClick={() => change(order.filter((item) => item !== id), `${label} removed.`)}>Remove</Button></>}
-            </li>
-          )
-        })}
-      </ol>
-      {!positions && !response.order?.length && <Button onClick={() => change(order, 'Starting order selected.')}>Use this order</Button>}
-      <span role="status">{announcement}</span>
-    </fieldset>
   )
 }
 
@@ -227,26 +157,49 @@ class InteractionBoundary extends Component<{ children: ReactNode; resetKey?: st
 
 type Kind = DisplayInteraction['kind']
 type RendererInput = RendererProps<DisplayInteraction>
-const choiceView = (props: RendererInput) => props.interaction.kind === 'SINGLE_CHOICE' || props.interaction.kind === 'MULTIPLE_CHOICE'
-  ? <Choices {...props} interaction={props.interaction} /> : null
-const targetView = (props: RendererInput) => 'targets' in props.interaction ? <Targets {...props} interaction={props.interaction} /> : null
+type InteractionOf<K extends Kind> = Extract<DisplayInteraction, { readonly kind: K }>
 
-const renderers: Readonly<Record<Kind, ComponentType<RendererInput>>> = {
-  SINGLE_CHOICE: choiceView,
-  MULTIPLE_CHOICE: choiceView,
-  DROPDOWN: targetView,
-  DROPDOWN_HOTSPOT: targetView,
-  MATCHING: targetView,
-  DRAG_DROP: targetView,
-  STATEMENT: (props) => 'targets' in props.interaction ? <Statements {...props} interaction={props.interaction} /> : null,
-  ORDERING: (props) => props.interaction.kind === 'ORDERING' ? <Ordering {...props} interaction={props.interaction} /> : null,
-  IMAGE_HOTSPOT: DeferredInteraction,
-  DIAGRAM_DEPENDENT: DeferredInteraction,
+function DiagramInteraction(props: RendererProps<InteractionOf<'DIAGRAM_DEPENDENT'>>) {
+  if (!isSupportedDiagram(props.interaction) || !props.availableExhibitIds?.includes(props.interaction.assetId)) {
+    return <p role="alert" className="information">The required exhibit is unavailable. You can continue to another question. No new response has been recorded.</p>
+  }
+  return <RegisteredInteraction {...props} interaction={props.interaction.interaction} />
+}
+
+function register<K extends Kind>(kind: K, Renderer: ComponentType<RendererProps<InteractionOf<K>>>): ComponentType<RendererInput> {
+  return function RegisteredKind(props) {
+    if (props.interaction.kind !== kind) return <DeferredInteraction />
+    // The runtime discriminant check guarantees this generic relationship.
+    return <Renderer {...props} interaction={props.interaction as InteractionOf<K>} />
+  }
+}
+
+const renderers = {
+  SINGLE_CHOICE: register('SINGLE_CHOICE', Choices),
+  MULTIPLE_CHOICE: register('MULTIPLE_CHOICE', Choices),
+  DROPDOWN: register('DROPDOWN', Targets),
+  DROPDOWN_HOTSPOT: register('DROPDOWN_HOTSPOT', Targets),
+  MATCHING: register('MATCHING', MatchingInteraction),
+  DRAG_DROP: register('DRAG_DROP', MatchingInteraction),
+  STATEMENT: register('STATEMENT', Statements),
+  ORDERING: register('ORDERING', OrderingInteraction),
+  IMAGE_HOTSPOT: register('IMAGE_HOTSPOT', DeferredInteraction),
+  DIAGRAM_DEPENDENT: register('DIAGRAM_DEPENDENT', DiagramInteraction),
+} satisfies Readonly<Record<Kind, ComponentType<RendererInput>>>
+
+function RegisteredInteraction(props: RendererInput) {
+  const kind = props.interaction?.kind
+  const Renderer = kind && Object.hasOwn(renderers, kind) ? renderers[kind] : DeferredInteraction
+  return <Renderer {...props} />
 }
 
 export function QuestionRenderer(props: RendererInput & { readonly questionKey?: string }) {
-  const kind = props.interaction?.kind
-  const Renderer = kind && Object.hasOwn(renderers, kind) ? renderers[kind] : DeferredInteraction
-  const stableKey = props.questionKey ?? kind
-  return <InteractionBoundary resetKey={stableKey}><Renderer key={stableKey} {...props} /></InteractionBoundary>
+  const stableKey = props.questionKey ?? props.interaction?.kind
+  // Defense in depth: read-only/disabled interactions cannot emit even through a
+  // synthetic event or an in-flight pointer operation finishing after a lock.
+  const disabled = Boolean(props.disabled || props.readOnly)
+  const onChange: RendererInput['onChange'] = (response) => { if (!disabled) props.onChange(response) }
+  return <InteractionBoundary resetKey={stableKey}>
+    <RegisteredInteraction key={stableKey} {...props} disabled={disabled} onChange={onChange} />
+  </InteractionBoundary>
 }

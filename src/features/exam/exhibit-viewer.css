@@ -1,0 +1,47 @@
+.exhibit-viewer { min-inline-size: 0; }
+.exhibit-viewer > img { object-fit: contain; max-height: 55dvh; }
+.exhibit-viewer > .button { margin-block: .35rem; }
+.exhibit-modal {
+  width: min(calc(100% - 1rem), 63rem);
+  max-width: calc(100% - 1rem);
+  max-height: min(94dvh, 55rem);
+  padding: clamp(.55rem, 2.5vw, 1.25rem);
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.exhibit-modal[open] { display: flex; flex-direction: column; gap: .55rem; }
+.exhibit-modal::backdrop { background: rgb(20 36 58 / 64%); }
+.exhibit-modal-header, .exhibit-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .4rem;
+}
+.exhibit-modal-header { justify-content: space-between; }
+.exhibit-modal-header h2 { font-size: 1.15rem; }
+.exhibit-toolbar .button[aria-disabled='true'] { background: var(--canvas); color: var(--secondary); cursor: default; }
+.exhibit-toolbar span { color: var(--secondary); font-variant-numeric: tabular-nums; font-size: .875rem; }
+.exhibit-modal .exhibit-viewport {
+  min-block-size: min(14rem, 35dvh);
+  max-block-size: min(66dvh, 42rem);
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: var(--canvas);
+  border: 1px solid var(--edge);
+  border-radius: .35rem;
+}
+.exhibit-modal .exhibit-viewport img {
+  display: block;
+  max-inline-size: none;
+  max-width: none;
+  height: auto;
+  object-fit: contain;
+  margin: 0;
+}
+.exhibit-modal .exhibit-viewport img[data-fit='true'] { max-height: min(64dvh, 40rem); }
+.exhibit-modal .exhibit-modal-description { white-space: pre-wrap; overflow-wrap: anywhere; }
+.exhibit-modal .exhibit-pan-help { font-size: .875rem; color: var(--secondary); }

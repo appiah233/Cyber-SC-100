@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 import type { CandidateAnswer } from '../src/domain'
 import { QuestionRenderer } from '../src/features/exam/QuestionRenderer'
-import type { DisplayInteraction } from '../src/features/exam/QuestionRenderer'
+import type { DisplayInteraction, DisplayResponse } from '../src/features/exam/QuestionRenderer'
 import { isCandidateAnswerFor, readDisplayResponse, responseState, toCandidateAnswer } from '../src/features/exam/question-response'
 
 const options = [
@@ -117,7 +117,7 @@ describe('question renderer markup', () => {
 
   it('exposes ordering positions, accessible move and remove names, and a live announcement region', () => {
     const html = markup(ordering, { order: ['green'] })
-    expect(html).toMatch(/First: Green/)
+    expect(html).toMatch(/>First<\/span> Green/)
     expect(html).toMatch(/<label[^>]*>Second<\/label>/)
     expect(html).toContain('aria-label="Move Green down"')
     expect(html).toContain('aria-label="Remove Green"')
@@ -129,6 +129,22 @@ describe('question renderer markup', () => {
     expect(html).toContain('Select 2 options')
     expect(html).toContain('2 of 2 selected')
     expect(html.match(/<input[^>]* disabled/g)).toHaveLength(1)
+  })
+
+  it('renders only the authored response control for a loaded diagram and disables it when read-only', () => {
+    const interaction = { kind: 'DIAGRAM_DEPENDENT', assetId: 'fixture-exhibit', interaction: { kind: 'SINGLE_CHOICE', options } } as const
+    const view = (exhibitIds?: readonly string[], readOnly = false) => {
+      const response: DisplayResponse = { selected: ['green'] }
+      return renderToStaticMarkup(<QuestionRenderer interaction={interaction} response={response}
+        availableExhibitIds={exhibitIds} readOnly={readOnly} onChange={() => undefined} />)
+    }
+    expect(view()).toContain('The required exhibit is unavailable')
+    expect(view(['different-exhibit'])).not.toContain('<input')
+    const loaded = view(['fixture-exhibit'], true)
+    expect(loaded.match(/type="radio"/g)).toHaveLength(3)
+    expect(loaded).toContain('<fieldset class="choices" disabled')
+    expect(loaded).toContain('checked=""')
+    expect(loaded).not.toContain('<img')
   })
 
   it('renders source content as escaped text and fails closed for geometry not supplied', () => {

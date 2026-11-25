@@ -8,6 +8,7 @@ on:
       - 'phase-3/**'
       - 'phase-4/**'
       - 'phase-5/**'
+      - 'phase-6/**'
       - 'remediation/**'
       - 'feature/**'
   pull_request:

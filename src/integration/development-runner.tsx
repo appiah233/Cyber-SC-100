@@ -5,7 +5,7 @@ import { Foundation } from './Foundation'
 const root = document.getElementById('root')
 if (!root) throw new Error('Missing local examination root')
 root.dataset.contentBoundary = 'PRIVATE_EXAM_CONTENT_CANARY'
-const { batch, questions, contexts } = displayPackage
+const { batch, questions, contexts, examTiming } = displayPackage
 createRoot(root).render(
   <Foundation source={{
     attemptId: 'protected-reference-candidate-v1',
@@ -17,6 +17,7 @@ createRoot(root).render(
     examTitle: 'SC-100 Practice Examination',
     contentNotice: 'Protected local development copy. Do not upload or share this practice content. This is not an official certification exam.',
     synthetic: false,
+    ...examTiming,
     question: (id, order) => {
       if (!Object.hasOwn(questions, id) || JSON.stringify(order) !== JSON.stringify(batch.optionOrder[id]))
         throw new Error('The pinned display question is unavailable')
