@@ -3,22 +3,31 @@ import App from '../app/App'
 import type { FoundationAction, FoundationPreview } from '../app/App'
 import type { DisplayResponse } from '../features/exam/QuestionRenderer'
 import { createAttempt, isAttemptSnapshot, transitionAttempt } from '../domain'
-import type { AttemptEvent, CandidateAnswer, ExamAttempt, ExamCycle, ExamSectionKind } from '../domain'
+import type { AttemptEvent, CandidateAnswer, ExamAttempt, ExamCycle } from '../domain'
 import { createExamRepository, StorageError } from '../storage'
 import type { WriterLease } from '../storage'
-import { ATTEMPT_ID, CYCLE_ID, PREVIEW_VERSION, previewBatch, previewCycle, previewQuestion, sectionTitles } from '../data/synthetic-preview'
+import { ATTEMPT_ID, CYCLE_ID, PREVIEW_VERSION, previewBatch, previewCycle, previewOptionOrder, previewQuestion, sectionTitles } from '../data/synthetic-preview'
 import { LEASE_MS, tabWriter } from './tab-writer'
 
 const shape = (attempt: ExamAttempt): boolean => {
-  if (!isAttemptSnapshot(attempt) || attempt.batch.id !== previewBatch.id || attempt.contentVersion !== PREVIEW_VERSION ||
-      JSON.stringify(attempt.batch.sections) !== JSON.stringify(previewBatch.sections) ||
-      Object.keys(attempt.optionOrder).length !== 0 || attempt.result !== null ||
+  if (!isAttemptSnapshot(attempt) || attempt.cycleId !== CYCLE_ID ||
+      attempt.batch.id !== previewBatch.id || attempt.contentVersion !== PREVIEW_VERSION ||
+      attempt.batch.seed !== previewBatch.seed || attempt.batch.mode !== previewBatch.mode ||
+      attempt.batch.sections.some((section, index) => {
+        const expected = previewBatch.sections[index]
+        return !expected || section.kind !== expected.kind || section.caseStudyId !== expected.caseStudyId ||
+          section.questionIds.length !== expected.questionIds.length ||
+          section.questionIds.some((id, position) => id !== expected.questionIds[position])
+      }) ||
+      Object.keys(attempt.optionOrder).length !== Object.keys(previewOptionOrder).length ||
+      Object.entries(previewOptionOrder).some(([id, order]) => JSON.stringify(attempt.optionOrder[id]) !== JSON.stringify(order)) ||
+      attempt.result !== null ||
       (attempt.status === 'SUBMITTED') !== (attempt.submittedAt !== null) || attempt.status === 'SCORED') return false
 
   return Object.entries(attempt.answers).every(([id, response]) => {
     const owner = previewBatch.sections.find((item) => item.questionIds.includes(id))
     if (!owner || !response || typeof response !== 'object') return false
-    const question = previewQuestion(id, owner.kind, owner.questionIds.indexOf(id))
+    const question = previewQuestion(id, attempt.optionOrder[id])
     const { interaction } = question
     if (response.kind !== interaction.kind) return false
     if (response.kind === 'SINGLE_CHOICE' && 'options' in interaction) {
@@ -37,7 +46,7 @@ const shape = (attempt: ExamAttempt): boolean => {
   )
 }
 
-const initialAttempt = () => createAttempt({ id: ATTEMPT_ID, cycleId: CYCLE_ID, batch: previewBatch })
+const initialAttempt = () => createAttempt({ id: ATTEMPT_ID, cycleId: CYCLE_ID, batch: previewBatch, optionOrder: previewOptionOrder })
 type ViewState = {
   attempt: ExamAttempt
   status: string
@@ -59,8 +68,8 @@ function asDisplay(answer: CandidateAnswer): DisplayResponse {
   return {}
 }
 
-function candidateResponse(section: ExamSectionKind, id: string, index: number, response: DisplayResponse, previous?: CandidateAnswer): CandidateAnswer | null {
-  const { interaction } = previewQuestion(id, section, index)
+function candidateResponse(id: string, optionOrder: readonly string[] | undefined, response: DisplayResponse, previous?: CandidateAnswer): CandidateAnswer | null {
+  const { interaction } = previewQuestion(id, optionOrder)
   if (interaction.kind === 'SINGLE_CHOICE' && 'options' in interaction) {
     const selected = response.selected?.[0]
     return interaction.options.some((item) => item.id === selected) && selected
@@ -110,6 +119,16 @@ export function Foundation() {
         hasUnsavedChange: Boolean(pending), canRetrySave: Boolean(pending && lease),
       })
     }
+    const attachWriter = async (granted: WriterLease) => {
+      // The record may have changed between the initial read and the lease grant.
+      // Load again under the newly fenced writer before showing an editable view.
+      const latest = await repo.load(ATTEMPT_ID, PREVIEW_VERSION)
+      if (!latest || latest.lease?.writerId !== granted.writerId || latest.lease.token !== granted.token) {
+        throw new StorageError('LEASE_LOST')
+      }
+      current = latest.attempt
+      lease = latest.lease
+    }
     const recover = async (error: unknown) => {
       if (error instanceof StorageError && ['WRITER_ACTIVE', 'TAKEOVER_REQUIRED', 'LEASE_LOST', 'STALE_REVISION'].includes(error.code)) {
         lease = null
@@ -123,6 +142,10 @@ export function Foundation() {
         }
       }
       lease = null
+      if (error instanceof StorageError && error.code === 'CONTENT_VERSION_MISMATCH') {
+        show('Saved content version cannot be resumed', 'This saved attempt is pinned to a different preview version. Nothing was replaced or removed.')
+        return
+      }
       const message = error instanceof StorageError ? error.message : 'Browser storage could not be opened. The attempt was not changed.'
       show('Local storage unavailable', message)
     }
@@ -167,16 +190,16 @@ export function Foundation() {
         const existing = await repo.load(ATTEMPT_ID, PREVIEW_VERSION)
         if (existing) {
           current = existing.attempt
-          lease = await repo.acquireWriter(ATTEMPT_ID, identity.id)
+          await attachWriter(await repo.acquireWriter(ATTEMPT_ID, identity.id))
         } else {
           try {
-            lease = await repo.initialize({ attempt: current, cycle: previewCycle, contentVersion: PREVIEW_VERSION, writerId: identity.id })
+            await attachWriter(await repo.initialize({ attempt: current, cycle: previewCycle, contentVersion: PREVIEW_VERSION, writerId: identity.id }))
           } catch (error) {
             if (!(error instanceof StorageError) || error.code !== 'ALREADY_EXISTS') throw error
             const latest = await repo.load(ATTEMPT_ID, PREVIEW_VERSION)
             if (!latest) throw error
             current = latest.attempt
-            lease = await repo.acquireWriter(ATTEMPT_ID, identity.id)
+            await attachWriter(await repo.acquireWriter(ATTEMPT_ID, identity.id))
           }
         }
         show('Saved on this device')
@@ -191,7 +214,7 @@ export function Foundation() {
           const existing = await repo.load(ATTEMPT_ID, PREVIEW_VERSION)
           if (!existing) return
           current = existing.attempt
-          lease = await repo.acquireWriter(ATTEMPT_ID, identity.id, { takeover: true, expectedToken: existing.lease?.token })
+          await attachWriter(await repo.acquireWriter(ATTEMPT_ID, identity.id, { takeover: true, expectedToken: existing.lease?.token }))
           review = false
           if (pending) show('Not saved', 'Retry or discard the unsaved change to continue.')
           else show('Saved on this device')
@@ -233,9 +256,8 @@ export function Foundation() {
         await commit({ type: 'TOGGLE_REVIEW', questionId: action.questionId, at })
       } else if (action.type === 'ANSWER') {
         const section = current.batch.sections.find((item) => item.kind === current.activeSection)
-        const index = section?.questionIds.indexOf(action.questionId) ?? -1
-        if (!section || index < 0) return
-        await commit({ type: 'SAVE_ANSWER', questionId: action.questionId, answer: candidateResponse(section.kind, action.questionId, index, action.response, current.answers[action.questionId]), at })
+        if (!section?.questionIds.includes(action.questionId)) return
+        await commit({ type: 'SAVE_ANSWER', questionId: action.questionId, answer: candidateResponse(action.questionId, current.optionOrder[action.questionId], action.response, current.answers[action.questionId]), at })
       } else if (action.type === 'SUBMIT_SECTION') {
         if (!current.activeSection || current.activeSection !== action.sectionId) return
         if (!await commit({ type: 'SUBMIT_SECTION', section: current.activeSection, at })) return
@@ -302,7 +324,7 @@ export function Foundation() {
       state: attempt.locks.includes(item.kind) ? 'locked' : item.kind === kind ? 'current' : 'upcoming',
     })),
     activeSectionId: kind,
-    questions: section?.questionIds.map((id, i) => previewQuestion(id, kind, i)) ?? [],
+    questions: section?.questionIds.map((id) => previewQuestion(id, attempt.optionOrder[id])) ?? [],
     position: attempt.position,
     answers: Object.fromEntries(Object.entries(attempt.answers).flatMap(([id, answer]) => answer ? [[id, asDisplay(answer)]] : [])),
     marks: Object.entries(attempt.reviewMarks).filter(([, marked]) => marked).map(([id]) => id),

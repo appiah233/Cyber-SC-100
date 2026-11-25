@@ -275,12 +275,21 @@ export function createExamRepository<
     }
   }
 
-  async function readAttempt(store: IDBObjectStore, id: string): Promise<AttemptRecord<A> | null> {
+  async function readAttempt(
+    store: IDBObjectStore,
+    id: string,
+    expectedContentVersion?: string,
+  ): Promise<AttemptRecord<A> | null> {
     const value: unknown = await requestResult(store.get(id));
     if (value === undefined) return null;
     if (!object(value) || value.id !== id || !text(value.contentVersion) || !revision(value.lastToken)
       || !(value.lease === null || (usableLease(value.lease) && value.lease.token === value.lastToken))) {
       throw new StorageError('CORRUPT');
+    }
+    if (expectedContentVersion !== undefined && value.contentVersion !== expectedContentVersion) {
+      // A validator specialized to the currently loaded bank may reject an older
+      // otherwise coherent snapshot. Diagnose the version pin before running it.
+      throw new StorageError('CONTENT_VERSION_MISMATCH');
     }
     checkAttempt<A>(value.attempt, options.validateAttempt);
     if (value.attempt.id !== id) throw new StorageError('CORRUPT');
@@ -359,11 +368,8 @@ export function createExamRepository<
 
     load(attemptId, expectedContentVersion) {
       return run('readonly', async (attempts, cycles) => {
-        const record = await readAttempt(attempts, attemptId);
+        const record = await readAttempt(attempts, attemptId, expectedContentVersion);
         if (!record) return null;
-        if (expectedContentVersion !== undefined && record.contentVersion !== expectedContentVersion) {
-          throw new StorageError('CONTENT_VERSION_MISMATCH');
-        }
         const cycle = await readCycle(cycles, record.attempt.cycleId);
         if (!cycle || cycle.contentVersion !== record.contentVersion) throw new StorageError('CORRUPT');
         return {

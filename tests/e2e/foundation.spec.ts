@@ -93,6 +93,7 @@ test('keyboard skip link, question navigation and lock dialog preserve focus', a
   await expect(page.getByRole('main')).toBeFocused()
 
   const start = page.getByRole('button', { name: 'Start practice exam' })
+  await expect(start).toBeEnabled()
   await start.focus()
   await page.keyboard.press('Enter')
   await expect(page.getByRole('region', { name: 'Question and response' })).toBeVisible()
