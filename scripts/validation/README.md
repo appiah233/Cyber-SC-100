@@ -1,0 +1,9 @@
+# Foundation public boundary
+
+- `npm run validate:source` checks the intended public checkout before dependency installation in CI. `npm run validate:dist` checks the built entry point, the case-sensitive project prefix and the limited foundation artifact inventory.
+- Start with only `index.html`, Vite's JavaScript/CSS/first-party SVG assets, and optionally an app-owned `favicon.svg` or `exam-icon.svg`. Expand the artifact allowlist only after reviewing the feature and its content policy. Keep source maps off in public builds.
+- The checks are defense in depth, not proof that arbitrary content is rights-cleared or secret-free. They reject known private paths, credential/PDF markers, bulk copies, symlinks, unrelated output and broken resource paths. Findings print rule categories and counts, not sensitive samples or paths. Review all intended tracked paths and their contents before any public push. Never put private source material or the owner-approved private fixture into this checkout, dependency caches, or generated output.
+- Source-answer comparison and semantic content review are not performed in public CI during Phase 2; no real bank is published. Verify these privately with the pinned inputs under their separate release gates. Client-side scoring cannot make scoring data secret.
+- Workflow actions are pinned to reviewed release commits. Review an official release and verify its full commit SHA before any update. CI does not install a deploy job or upload artifacts.
+
+References: [GitHub Actions workflow security](https://docs.github.com/en/actions/reference/security/secure-use), [Vite static deployment](https://vite.dev/guide/static-deploy#github-pages), [Playwright CI](https://playwright.dev/docs/ci).
