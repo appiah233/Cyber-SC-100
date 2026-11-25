@@ -452,6 +452,46 @@ function generatedFields(
   }
 }
 
+/**
+ * Preserve the exact order of an independently pinned development reference.
+ * Normal generation remains the authority for capacity. This path cannot
+ * expose other eligible IDs, reserve anything, or be used in production.
+ */
+export function generateExactDevelopmentBatch(
+  input: BatchGenerationInput,
+  exact: readonly ExamSection[],
+): BatchGenerationResult {
+  if (input.eligibilityPolicy !== 'DEVELOPMENT') return fail('INSUFFICIENT_PRODUCTION_CONTENT')
+  const generated = generateBatch(input)
+  if (!generated.ok) return generated
+  if (generated.batch.kind !== 'NORMAL_BATCH') return fail('INVALID_INPUT', generated.diagnostics)
+  const prepared = prepareBatchInventory(input)
+  if (!prepared.ok) return prepared
+  const { inventory, diagnostics } = prepared
+  const ids = exact.flatMap(section => section.questionIds)
+  const families = new Map(inventory.caseFamilies.map(family => [family.id, new Set(family.questionIds)]))
+  const standards = new Set(inventory.standardIds)
+  const interactions = new Set(inventory.interactiveIds)
+  if (exact.length !== NORMAL_SECTIONS.length || ids.length !== inventory.eligibleIds.length
+    || new Set(ids).size !== ids.length
+    || exact[0]?.caseStudyId === exact[1]?.caseStudyId
+    || exact.some((section, index) => {
+      const shape = NORMAL_SECTIONS[index]!
+      if (section.kind !== shape.kind || section.questionIds.length !== shape.count) return true
+      if (index < 2) {
+        const children = families.get(section.caseStudyId ?? '')
+        return !children || !section.questionIds.every(id => children.has(id))
+      }
+      const pool = index === 2 ? standards : interactions
+      return section.caseStudyId !== undefined || !section.questionIds.every(id => pool.has(id))
+    })) return fail('INVALID_INPUT', diagnostics)
+  const sections = snapshotSections(exact)
+  const batch: GeneratedNormalBatch = Object.freeze({
+    kind: 'NORMAL_BATCH', ...generatedFields(input, inventory, sections), sections,
+  })
+  return { ok: true, batch, diagnostics }
+}
+
 export function generateBatch(input: BatchGenerationInput): BatchGenerationResult {
   if (!((typeof input.seed === 'string' && input.seed.length > 0)
     || (typeof input.seed === 'number' && Number.isFinite(input.seed)))) return fail('INVALID_INPUT')

@@ -3,6 +3,7 @@ import { allocateRoles } from '../src/domain/batch-allocation'
 import type { RoleCandidate } from '../src/domain/batch-allocation'
 import {
   generateBatch,
+  generateExactDevelopmentBatch,
   INTERACTIVE_PRIORITY,
   prepareBatchInventory,
 } from '../src/domain/batch-engine'
@@ -325,5 +326,40 @@ describe('exact role allocation oracle', () => {
       const feasibilityOnly = allocateRoles(roles.map(({ id, quota, questionIds }) => ({ id, quota, questionIds })))
       expect(Boolean(feasibilityOnly)).toBe(Number.isFinite(optimum))
     }
+  })
+})
+
+describe('exact local development reference', () => {
+  it('keeps the independently supplied exact precedence and its mapped source identities', () => {
+    const spec = input(makeBank(), 14)
+    const generated = normal(spec)
+    const cases = generated.sections.slice(0, 2).reverse().map((section, index) => ({
+      ...section, kind: index === 0 ? 'CASE_STUDY_1' as const : 'CASE_STUDY_2' as const,
+      questionIds: [...section.questionIds].reverse(),
+    }))
+    const exact = [...cases, ...generated.sections.slice(2).map(section => ({ ...section, questionIds: [...section.questionIds].reverse() }))]
+    const result = generateExactDevelopmentBatch(spec, exact)
+    if (!result.ok || result.batch.kind !== 'NORMAL_BATCH') throw new Error('Exact reference rejected')
+    expect(result.batch.sections).toEqual(exact)
+    expect(result.batch.sourceIds).toEqual(exact.flatMap(section => section.questionIds))
+    expect(result.batch.optionOrder).toEqual(generated.optionOrder)
+    expect(result.batch.id).not.toBe(generated.id)
+  })
+
+  it('refuses production, held-out IDs, incorrect roles, duplicates and partial or larger inventory', () => {
+    const spec = input(makeBank())
+    const sections = normal(spec).sections
+    expect(generateExactDevelopmentBatch({ ...spec, eligibilityPolicy: 'PRODUCTION' }, sections))
+      .toMatchObject({ ok: false, reason: 'INSUFFICIENT_PRODUCTION_CONTENT' })
+    expect(generateExactDevelopmentBatch(spec, sections.slice(0, -1))).toMatchObject({ ok: false })
+    const duplicate = sections.map((section, i) => i === 2
+      ? { ...section, questionIds: [sections[0]!.questionIds[0]!, ...section.questionIds.slice(1)] }
+      : section)
+    expect(generateExactDevelopmentBatch(spec, duplicate)).toMatchObject({ ok: false })
+    expect(generateExactDevelopmentBatch(spec, sections.map((section, i) => i === 0 ? { ...section, caseStudyId: 'bad-family' } : section))).toMatchObject({ ok: false })
+    const larger = { ...spec.bank, questions: [...spec.bank.questions, question('eligible-but-unlisted', { standardEligible: true })] }
+    expect(generateExactDevelopmentBatch(input(larger), sections)).toMatchObject({ ok: false })
+    const changed = { ...spec.bank, questions: spec.bank.questions.map(q => q.sourceId === sections[3]?.questionIds[0] ? { ...q, held: true } : q) }
+    expect(generateExactDevelopmentBatch(input(changed), sections)).toMatchObject({ ok: false })
   })
 })

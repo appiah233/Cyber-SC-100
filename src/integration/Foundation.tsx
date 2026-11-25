@@ -1,313 +1,349 @@
-import { useEffect, useRef, useState } from 'react'
+import { Component, useEffect, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
 import App from '../app/App'
 import type { FoundationAction, FoundationPreview } from '../app/App'
-import type { DisplayResponse } from '../features/exam/QuestionRenderer'
-import { createAttempt, isAttemptSnapshot, transitionAttempt } from '../domain'
-import type { AttemptEvent, CandidateAnswer, ExamAttempt, ExamCycle } from '../domain'
+import { readDisplayResponse } from '../features/exam/question-response'
 import { createExamRepository, StorageError } from '../storage'
-import type { WriterLease } from '../storage'
-import { ATTEMPT_ID, CYCLE_ID, PREVIEW_VERSION, previewBatch, previewCycle, previewOptionOrder, previewQuestion, sectionTitles } from '../data/synthetic-preview'
+import type { SavedExam, WriterLease } from '../storage'
+import { ATTEMPT_ID, previewBatch, previewContext, previewQuestion, sectionTitles } from '../data/synthetic-preview'
+import {
+  atIntermediateBoundary, candidateChange, candidateQuestion, candidateSection, candidateValidators,
+  initialCandidate, isRecoveryAction, restoreCandidateCursor,
+} from './candidate-attempt'
+import type { CandidateCycle, CandidateSnapshot, FoundationSource } from './candidate-attempt'
 import { LEASE_MS, tabWriter } from './tab-writer'
 
-const shape = (attempt: ExamAttempt): boolean => {
-  if (!isAttemptSnapshot(attempt) || attempt.cycleId !== CYCLE_ID ||
-      attempt.batch.id !== previewBatch.id || attempt.contentVersion !== PREVIEW_VERSION ||
-      attempt.batch.seed !== previewBatch.seed || attempt.batch.mode !== previewBatch.mode ||
-      attempt.batch.sections.some((section, index) => {
-        const expected = previewBatch.sections[index]
-        return !expected || section.kind !== expected.kind || section.caseStudyId !== expected.caseStudyId ||
-          section.questionIds.length !== expected.questionIds.length ||
-          section.questionIds.some((id, position) => id !== expected.questionIds[position])
-      }) ||
-      Object.keys(attempt.optionOrder).length !== Object.keys(previewOptionOrder).length ||
-      Object.entries(previewOptionOrder).some(([id, order]) => JSON.stringify(attempt.optionOrder[id]) !== JSON.stringify(order)) ||
-      attempt.result !== null ||
-      (attempt.status === 'SUBMITTED') !== (attempt.submittedAt !== null) || attempt.status === 'SCORED') return false
+export type { FoundationSource } from './candidate-attempt'
 
-  return Object.entries(attempt.answers).every(([id, response]) => {
-    const owner = previewBatch.sections.find((item) => item.questionIds.includes(id))
-    if (!owner || !response || typeof response !== 'object') return false
-    const question = previewQuestion(id, attempt.optionOrder[id])
-    const { interaction } = question
-    if (response.kind !== interaction.kind) return false
-    if (response.kind === 'SINGLE_CHOICE' && 'options' in interaction) {
-      return interaction.options.some((item) => item.id === response.optionId)
-    }
-    if ('selections' in response && 'targets' in interaction && response.selections &&
-        typeof response.selections === 'object' && !Array.isArray(response.selections)) {
-      const entries = Object.entries(response.selections)
-      return entries.length > 0 && entries.every(([targetId, value]) => interaction.targets.some(
-        (target) => target.id === targetId && target.options.some((option) => option.id === value),
-      ))
-    }
-    return false
-  }) && Object.entries(attempt.reviewMarks).every(([id, mark]) =>
-    previewCycle.reservedQuestionIds.includes(id) && typeof mark === 'boolean',
-  )
+const syntheticSource: FoundationSource = {
+  attemptId: ATTEMPT_ID, batch: previewBatch, question: previewQuestion, synthetic: true,
+  context: previewContext,
 }
 
-const initialAttempt = () => createAttempt({ id: ATTEMPT_ID, cycleId: CYCLE_ID, batch: previewBatch, optionOrder: previewOptionOrder })
+type DisplayError = NonNullable<FoundationPreview['error']>
 type ViewState = {
-  attempt: ExamAttempt
+  attempt: CandidateSnapshot | null
   status: string
   notice?: string
+  error?: DisplayError
   readOnly: boolean
   takeover?: boolean
   hasUnsavedChange?: boolean
   canRetrySave?: boolean
-  review?: boolean
 }
 
-function asDisplay(answer: CandidateAnswer): DisplayResponse {
-  if (answer.kind === 'SINGLE_CHOICE') return { selected: [answer.optionId] }
-  if (answer.kind === 'MULTIPLE_CHOICE') return { selected: answer.optionIds }
-  if (answer.kind === 'ORDERING') return { order: answer.optionIds }
-  if ('selections' in answer) return { targets: Object.fromEntries(
-    Object.entries(answer.selections).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
-  ) }
-  return {}
+const opening: ViewState = { attempt: null, status: 'Opening browser storage…', readOnly: true }
+const renderError: DisplayError = {
+  title: 'Examination content unavailable',
+  description: 'This content could not be displayed. Reload the same examination to try again. Your saved progress has not been reset.',
 }
 
-function candidateResponse(id: string, optionOrder: readonly string[] | undefined, response: DisplayResponse, previous?: CandidateAnswer): CandidateAnswer | null {
-  const { interaction } = previewQuestion(id, optionOrder)
-  if (interaction.kind === 'SINGLE_CHOICE' && 'options' in interaction) {
-    const selected = response.selected?.[0]
-    return interaction.options.some((item) => item.id === selected) && selected
-      ? { kind: 'SINGLE_CHOICE', optionId: selected } : null
-  }
-  if ((interaction.kind === 'MATCHING' || interaction.kind === 'DROPDOWN_HOTSPOT') && 'targets' in interaction) {
-    const delta = response.targetChange
-    const selections = delta ? {
-      ...(previous && 'selections' in previous ? previous.selections : {}),
-      [delta.id]: delta.value ?? undefined,
-    } : response.targets ?? {}
-    const entries = interaction.targets.flatMap((target) => {
-      const value = selections[target.id]
-      return value && target.options.some((option) => option.id === value) ? [[target.id, value] as const] : []
-    })
-    return entries.length ? { kind: interaction.kind, selections: Object.fromEntries(entries) } : null
-  }
-  return null
+class CandidateDisplayBoundary extends Component<{ children: ReactNode; fallback: ReactNode; onError?: () => void }, { failed: boolean }> {
+  state = { failed: false }
+  static getDerivedStateFromError() { return { failed: true } }
+  componentDidCatch() { this.props.onError?.() }
+  render() { return this.state.failed ? this.props.fallback : this.props.children }
 }
 
-export function Foundation() {
-  const [state, setState] = useState<ViewState>(() => ({ attempt: initialAttempt(), status: 'Opening browser storage…', readOnly: true }))
+function CandidateSession({ source }: { source: FoundationSource }) {
+  const [state, setState] = useState<ViewState>(opening)
   const dispatchRef = useRef<(action: FoundationAction) => void>(() => undefined)
+  const displayFailed = useRef(false)
+  const abortDisplay = useRef<() => void>(() => undefined)
 
   useEffect(() => {
-    const repo = createExamRepository<ExamAttempt, ExamCycle>({
-      leaseDurationMs: LEASE_MS,
-      validateAttempt: shape,
-      validateCycle: (cycle) => cycle.id === CYCLE_ID &&
-        cycle.contentVersion === PREVIEW_VERSION && Array.isArray(cycle.reservedQuestionIds) &&
-        cycle.reservedQuestionIds.length === 59 && Array.isArray(cycle.consumedQuestionIds) &&
-        new Set(cycle.reservedQuestionIds).size === 59 && cycle.reservedQuestionIds.every((id) => previewCycle.reservedQuestionIds.includes(id)),
-    })
+    let repo: ReturnType<typeof createExamRepository<CandidateSnapshot, CandidateCycle>>
+    try {
+      repo = createExamRepository<CandidateSnapshot, CandidateCycle>({
+        databaseName: source.idbName,
+        leaseDurationMs: LEASE_MS,
+        ...candidateValidators(source),
+      })
+    } catch {
+      // The initialization promise/effect never passes invalid content to the editor.
+      const report = window.requestAnimationFrame(() => setState({ ...opening, status: 'Content unavailable', error: renderError }))
+      return () => window.cancelAnimationFrame(report)
+    }
+
+    const { attemptId } = source
+    const version = source.batch.contentVersion
     let stopped = false
-    let current = initialAttempt()
+    let saved: SavedExam<CandidateSnapshot, CandidateCycle> | null = null
     let lease: WriterLease | null = null
     let identity: Awaited<ReturnType<typeof tabWriter>> | undefined
-    let review = false
-    let pending: AttemptEvent | null = null
-    let pendingBaseRevision: number | null = null
+    let blocked: DisplayError | undefined
+    let inFlight = false
+    let pending: { change: NonNullable<ReturnType<typeof candidateChange>>; revision: number; cycleRevision: number; optimistic: boolean } | null = null
     let tail: Promise<unknown> = Promise.resolve()
     const queue = (job: () => Promise<void>) => {
       tail = tail.catch(() => undefined).then(async () => { if (!stopped) await job() })
     }
-    const show = (status: string, notice?: string, take = false) => {
-      if (!stopped) setState({ attempt: current, status, notice, readOnly: !lease || Boolean(pending), review, takeover: take,
-        hasUnsavedChange: Boolean(pending), canRetrySave: Boolean(pending && lease),
+
+    const show = (status: string, notice?: string, take = false, optimistic?: CandidateSnapshot) => {
+      if (stopped) return
+      const canRetry = pending !== null && lease !== null
+        && pending.revision === saved?.attempt.revision && pending.cycleRevision === saved.cycleRevision
+      setState({
+        attempt: optimistic ?? (canRetry && pending?.optimistic ? pending.change.attempt : saved?.attempt ?? null),
+        status, notice, error: blocked, readOnly: !lease || Boolean(pending) || Boolean(blocked),
+        takeover: take, hasUnsavedChange: Boolean(pending), canRetrySave: canRetry,
       })
     }
-    const attachWriter = async (granted: WriterLease) => {
-      // The record may have changed between the initial read and the lease grant.
-      // Load again under the newly fenced writer before showing an editable view.
-      const latest = await repo.load(ATTEMPT_ID, PREVIEW_VERSION)
-      if (!latest || latest.lease?.writerId !== granted.writerId || latest.lease.token !== granted.token) {
-        throw new StorageError('LEASE_LOST')
-      }
-      current = latest.attempt
-      lease = latest.lease
+
+    const reconcile = (record: SavedExam<CandidateSnapshot, CandidateCycle> | null) => {
+      saved = record ? { ...record, attempt: restoreCandidateCursor(record.attempt) } : null
     }
+
+    const showPassive = () => {
+      const eligible = Boolean(saved && (!saved.lease || saved.lease.expiresAt <= Date.now()))
+      show('Read-only in this tab', eligible
+        ? 'The editing session has ended. Choose Take over editing to continue here.'
+        : 'This examination is open for editing in another tab. You can follow saved progress here without making changes.', eligible)
+    }
+
     const recover = async (error: unknown) => {
-      if (error instanceof StorageError && ['WRITER_ACTIVE', 'TAKEOVER_REQUIRED', 'LEASE_LOST', 'STALE_REVISION'].includes(error.code)) {
-        lease = null
+      if (stopped) return
+      lease = null
+      if (error instanceof StorageError && ['WRITER_ACTIVE', 'TAKEOVER_REQUIRED', 'LEASE_LOST', 'STALE_REVISION', 'CYCLE_CONFLICT'].includes(error.code)) {
         try {
-          const latest = await repo.load(ATTEMPT_ID, PREVIEW_VERSION)
-          if (latest) current = latest.attempt
-          show('Read-only in this tab', 'Another editing session holds the saved attempt. You can take over once its lease expires.', Boolean(latest))
-          return
+          reconcile(await repo.load(attemptId, version))
+          if (saved) { showPassive(); return }
+          error = new StorageError('NOT_FOUND')
         } catch (loadError) {
           error = loadError
         }
       }
-      lease = null
+
       if (error instanceof StorageError && error.code === 'CONTENT_VERSION_MISMATCH') {
-        show('Saved content version cannot be resumed', 'This saved attempt is pinned to a different preview version. Nothing was replaced or removed.')
-        return
+        blocked = {
+          title: 'Saved content version cannot be resumed',
+          description: 'This attempt is pinned to a different version. Open it with the original approved content to resume. Nothing was replaced or removed.',
+        }
+      } else if (error instanceof StorageError && error.code === 'CORRUPT') {
+        blocked = { title: 'Saved examination could not be opened', description: error.message }
+      } else {
+        blocked = {
+          title: 'Local storage unavailable',
+          description: 'Reload the examination after checking that you can use browser storage. No new attempt was created and no saved data was replaced.',
+        }
       }
-      const message = error instanceof StorageError ? error.message : 'Browser storage could not be opened. The attempt was not changed.'
-      show('Local storage unavailable', message)
+      show(blocked.title)
     }
 
-    const commit = async (event: AttemptEvent, announce = true) => {
-      if (!lease) return false
-      const result = transitionAttempt(current, event)
-      if (!result.ok) {
-        show(pending ? 'Not saved' : 'Action not applied', pending
-          ? 'The unsaved change no longer applies to this stage. Discard it to use the saved attempt.'
-          : 'This action is not available at the current stage.')
-        return false
-      }
-      if (result.attempt === current) return true
+    const releaseOnDisplayFailure = async () => {
+      if (blocked === renderError) return
+      blocked = renderError
+      const previousLease = lease
+      lease = null
+      show('Content unavailable')
+      // No edits are accepted while content is unavailable. Drop a healthy
+      // lease here, but never overwrite a lease acquired by a later tab.
       try {
-        if (announce) show('Saving…')
-        current = await repo.save({ attempt: result.attempt, expectedRevision: current.revision, lease })
-        if (pending === event) { pending = null; pendingBaseRevision = null }
-        if (announce) show('Saved on this device')
-        return true
-      } catch (error) {
-        if (event.type === 'SAVE_ANSWER' || event.type === 'TOGGLE_REVIEW') {
-          pending = event
-          pendingBaseRevision = current.revision
+        if (previousLease) await repo.releaseWriter(attemptId, previousLease)
+      } catch { /* The fence may already have expired; leave the durable attempt intact. */ }
+      identity?.release()
+    }
+    abortDisplay.current = () => {
+      displayFailed.current = true
+      queue(releaseOnDisplayFailure)
+    }
+
+    const attachWriter = async (granted: WriterLease) => {
+      // Loading after acquire guards the read→grant race. Pair validation here
+      // also checks the persisted attempt against the actual Phase 4 batch status.
+      const latest = await repo.load(attemptId, version)
+      if (!latest || latest.lease?.writerId !== granted.writerId || latest.lease.token !== granted.token) {
+        throw new StorageError('LEASE_LOST')
+      }
+      reconcile(latest)
+      lease = latest.lease
+    }
+
+    const save = async (edit: NonNullable<typeof pending>) => {
+      if (!lease || !saved) return
+      if (edit.revision !== saved.attempt.revision || edit.cycleRevision !== saved.cycleRevision) {
+        show('Save failed', 'The saved examination changed in another tab. Discard this unsaved change to continue.')
+        return
+      }
+      const { change } = edit
+      const cycleChanged = change.cycle !== saved.cycle
+      const durable = saved
+      // Make answer controls controlled by the tentative local value. Do not
+      // advance an exam boundary or new question until its save is durable.
+      if (pending === edit) pending = null
+      inFlight = true
+      show('Saving…', undefined, false, edit.optimistic ? change.attempt : undefined)
+      try {
+        const attempt = await repo.save({
+          attempt: change.attempt, expectedRevision: edit.revision, lease,
+          ...(cycleChanged ? { cycleUpdate: { cycle: change.cycle, expectedRevision: edit.cycleRevision } } : {}),
+        })
+        saved = {
+          ...durable, attempt: restoreCandidateCursor(attempt), cycle: change.cycle,
+          cycleRevision: durable.cycleRevision + (cycleChanged ? 1 : 0), lease,
         }
+        show('Saved on this device')
+      } catch (error) {
+        pending = edit
         if (error instanceof StorageError && ['UNAVAILABLE', 'QUOTA_EXCEEDED'].includes(error.code)) {
-          show('Not saved', error.message + (pending ? ' Retry or discard this change to continue.' : ' Retry the action to continue.'))
+          show('Save failed', error.message + ' Retry or discard this unsaved change before continuing.')
         } else {
           await recover(error)
         }
-        return false
+      } finally {
+        inFlight = false
+      }
+    }
+
+    const write = async (action: Exclude<FoundationAction, { type: 'TAKE_OVER' | 'RETRY_SAVE' | 'DISCARD_UNSAVED' }> | { type: 'RESUME_BOUNDARY' }) => {
+      if (!saved || !lease || pending || blocked || displayFailed.current) return
+      let change: ReturnType<typeof candidateChange>
+      try {
+        change = candidateChange(saved.attempt, saved.cycle, source, action, Date.now())
+      } catch {
+        // No response was committed against an unavailable question contract.
+        await releaseOnDisplayFailure()
+        return
+      }
+      if (!change) return
+      await save({
+        change, revision: saved.attempt.revision, cycleRevision: saved.cycleRevision,
+        optimistic: action.type === 'ANSWER' || action.type === 'TOGGLE_MARK',
+      })
+    }
+
+    const ready = async () => {
+      if (pending) {
+        const fresh = saved?.attempt.revision === pending.revision && saved.cycleRevision === pending.cycleRevision
+        show('Save failed', fresh ? 'Retry or discard the unsaved change to continue.'
+          : 'The saved examination changed in another tab. Discard the unsaved change to continue.')
+      } else if (saved && atIntermediateBoundary(saved.attempt)) {
+        await write({ type: 'RESUME_BOUNDARY' })
+      } else {
+        show('Saved on this device')
       }
     }
 
     queue(async () => {
       try {
+        const record = await repo.load(attemptId, version)
+        if (stopped) return
+        reconcile(record)
         identity = await tabWriter()
-        if (stopped) {
-          identity.release()
-          return
-        }
-        const existing = await repo.load(ATTEMPT_ID, PREVIEW_VERSION)
-        if (existing) {
-          current = existing.attempt
-          await attachWriter(await repo.acquireWriter(ATTEMPT_ID, identity.id))
+        if (stopped) { identity.release(); return }
+        if (record) {
+          await attachWriter(await repo.acquireWriter(attemptId, identity.id))
         } else {
           try {
-            await attachWriter(await repo.initialize({ attempt: current, cycle: previewCycle, contentVersion: PREVIEW_VERSION, writerId: identity.id }))
+            const initial = initialCandidate(source, Date.now())
+            await attachWriter(await repo.initialize({ ...initial, contentVersion: version, writerId: identity.id }))
           } catch (error) {
             if (!(error instanceof StorageError) || error.code !== 'ALREADY_EXISTS') throw error
-            const latest = await repo.load(ATTEMPT_ID, PREVIEW_VERSION)
-            if (!latest) throw error
-            current = latest.attempt
-            await attachWriter(await repo.acquireWriter(ATTEMPT_ID, identity.id))
+            await attachWriter(await repo.acquireWriter(attemptId, identity.id))
           }
         }
-        show('Saved on this device')
+        await ready()
       } catch (error) {
         await recover(error)
       }
     })
 
     dispatchRef.current = (action) => queue(async () => {
-      if (action.type === 'TAKE_OVER' && identity) {
-        try {
-          const existing = await repo.load(ATTEMPT_ID, PREVIEW_VERSION)
-          if (!existing) return
-          current = existing.attempt
-          await attachWriter(await repo.acquireWriter(ATTEMPT_ID, identity.id, { takeover: true, expectedToken: existing.lease?.token }))
-          review = false
-          if (pending) show('Not saved', 'Retry or discard the unsaved change to continue.')
-          else show('Saved on this device')
-        } catch (error) {
-          await recover(error)
-        }
-        return
-      }
+      if (displayFailed.current || blocked) return
+      if (!isRecoveryAction(action)) { await write(action); return }
       if (action.type === 'RETRY_SAVE') {
-        if (pending && lease) {
-          if (pendingBaseRevision !== current.revision) show('Not saved', 'The saved attempt changed in another tab. Discard the unsaved change before continuing.')
-          else await commit(pending)
-        }
+        if (pending && lease) await save(pending)
         return
       }
       if (action.type === 'DISCARD_UNSAVED') {
-        if (pending) {
-          pending = null
-          pendingBaseRevision = null
-          show(lease ? 'Saved on this device' : 'Read-only in this tab', 'Unsaved change discarded.', !lease)
-        }
+        if (!pending) return
+        pending = null
+        if (lease) await ready()
+        else showPassive()
         return
       }
-      if (!lease || pending) return
-      const at = Date.now()
-      if (action.type === 'START') {
-        if (current.status === 'CREATED' && !(await commit({ type: 'PREPARE', at }))) return
-        await commit({ type: 'START_SECTION', at })
-      } else if (action.type === 'OPEN_REVIEW' || action.type === 'CLOSE_REVIEW') {
-        if (!current.activeSection) return
-        review = action.type === 'OPEN_REVIEW'
-        show('Saved on this device')
-      } else if (action.type === 'NAVIGATE') {
-        if (await commit({ type: 'NAVIGATE', position: action.position, at })) {
-          review = false
-          show('Saved on this device')
+      if (action.type === 'TAKE_OVER' && identity && !lease) {
+        try {
+          const record = await repo.load(attemptId, version)
+          if (!record) throw new StorageError('NOT_FOUND')
+          await attachWriter(await repo.acquireWriter(attemptId, identity.id, { takeover: true, expectedToken: record.lease?.token }))
+          await ready()
+        } catch (error) {
+          await recover(error)
         }
-      } else if (action.type === 'TOGGLE_MARK') {
-        await commit({ type: 'TOGGLE_REVIEW', questionId: action.questionId, at })
-      } else if (action.type === 'ANSWER') {
-        const section = current.batch.sections.find((item) => item.kind === current.activeSection)
-        if (!section?.questionIds.includes(action.questionId)) return
-        await commit({ type: 'SAVE_ANSWER', questionId: action.questionId, answer: candidateResponse(action.questionId, current.optionOrder[action.questionId], action.response, current.answers[action.questionId]), at })
-      } else if (action.type === 'SUBMIT_SECTION') {
-        if (!current.activeSection || current.activeSection !== action.sectionId) return
-        if (!await commit({ type: 'SUBMIT_SECTION', section: current.activeSection, at })) return
-        review = false
-        if (current.locks.length === 4) await commit({ type: 'OPEN_FINAL_REVIEW', at })
-        else await commit({ type: 'START_SECTION', at })
-      } else if (action.type === 'FINAL_SUBMIT') {
-        if (current.status === 'INTERACTIVE_BLOCK_SUBMITTED' && !await commit({ type: 'OPEN_FINAL_REVIEW', at })) return
-        await commit({ type: 'FINAL_SUBMIT', at })
       }
     })
 
-    const heartbeat = window.setInterval(() => queue(async () => {
-      if (!lease || !identity) return
+    const refresh = async (renew: boolean) => {
+      if (!identity || blocked || displayFailed.current) return
       try {
-        lease = await repo.acquireWriter(ATTEMPT_ID, identity.id)
+        if (lease) {
+          if (renew) lease = await repo.acquireWriter(attemptId, identity.id)
+          return
+        }
+        const latest = await repo.load(attemptId, version)
+        if (!latest) throw new StorageError('NOT_FOUND')
+        reconcile(latest)
+        showPassive()
       } catch (error) {
         await recover(error)
       }
-    }), LEASE_MS / 3)
-    // Let the database fence expire on close. An unload release can otherwise
-    // race a reload that correctly resumed with the same tab identity and token.
-    const release = () => { identity?.release() }
-    const pageHide = (event: PageTransitionEvent) => { if (!event.persisted) release() }
-    const beforeUnload = (event: BeforeUnloadEvent) => {
-      if (pending) event.preventDefault()
     }
+    const heartbeat = window.setInterval(() => queue(() => refresh(true)), LEASE_MS / 3)
+    const passivePoll = window.setInterval(() => {
+      if (!lease) queue(() => refresh(false))
+    }, 1_500)
+    const focused = () => queue(() => refresh(true))
+    const pageHide = (event: PageTransitionEvent) => { if (!event.persisted) identity?.release() }
+    const beforeUnload = (event: BeforeUnloadEvent) => {
+      if (pending || inFlight) {
+        event.preventDefault()
+        event.returnValue = ''
+      }
+    }
+    window.addEventListener('focus', focused)
+    window.addEventListener('pageshow', focused)
     window.addEventListener('pagehide', pageHide)
     window.addEventListener('beforeunload', beforeUnload)
     return () => {
       stopped = true
+      dispatchRef.current = () => undefined
+      abortDisplay.current = () => undefined
       window.clearInterval(heartbeat)
+      window.clearInterval(passivePoll)
+      window.removeEventListener('focus', focused)
+      window.removeEventListener('pageshow', focused)
       window.removeEventListener('pagehide', pageHide)
       window.removeEventListener('beforeunload', beforeUnload)
-      release()
-      void tail.finally(() => repo.close())
+      // Keep the database fence for same-document reload safety; unlike the
+      // authoritatively time-fenced IndexedDB lease, the Web Lock is document-only.
+      identity?.release()
+      void tail.finally(() => repo.close()).catch(() => undefined)
     }
-  }, [])
+  }, [source])
 
   const { attempt } = state
-  const section = attempt.batch.sections.find((item) => item.kind === attempt.activeSection) ?? attempt.batch.sections[attempt.locks.length]
-  const kind = section?.kind ?? 'FINAL_INTERACTIVE_BLOCK'
-  const final = attempt.status === 'FINAL_SUBMISSION_PENDING' || attempt.status === 'INTERACTIVE_BLOCK_SUBMITTED'
-  const complete = attempt.status === 'SUBMITTED' || attempt.status === 'SCORED'
-  const view = complete ? 'complete' : final ? 'final' : !attempt.activeSection ? 'intro' : state.review ? 'review' : 'question'
+  const hasStarted = Boolean(attempt && attempt.status !== 'CREATED' && attempt.status !== 'READY')
+  const active = attempt ? candidateSection(attempt) : undefined
+  const section = active ?? source.batch.sections[attempt?.locks.length ?? 0]
+  const complete = attempt?.status === 'SUBMITTED'
+  const final = attempt?.status === 'FINAL_SUBMISSION_PENDING' || attempt?.status === 'INTERACTIVE_BLOCK_SUBMITTED'
+  let view: NonNullable<FoundationPreview['view']> = state.error ? 'error' : complete ? 'complete'
+    : final ? 'final' : !hasStarted ? 'intro' : !active ? 'intro'
+    : attempt?.candidateView === 'review' ? 'review' : 'question'
+  if (hasStarted && !active && view === 'intro') view = 'error'
+  const defaultError = hasStarted && !active && view === 'error' && !state.error
+    ? { title: 'Section change pending', description: 'This section is already locked. Resume editing to continue to the next section.' }
+    : undefined
 
+  const reconcileRoute = Boolean(state.attempt || state.error)
   useEffect(() => {
+    if (!reconcileRoute) return
+    // The URL only reflects persisted navigation. It never loads a section,
+    // cursor, answer, review state, or action from user-controlled parameters.
     const path = view === 'intro' ? '#/start' : '#/' + view
     const guard = () => {
-      if (window.location.hash !== path) window.history.replaceState(null, '', path)
+      if (window.location.hash !== path) window.history.replaceState(window.history.state, '', path)
     }
     guard()
     window.addEventListener('hashchange', guard)
@@ -316,29 +352,64 @@ export function Foundation() {
       window.removeEventListener('hashchange', guard)
       window.removeEventListener('popstate', guard)
     }
-  }, [view])
+  }, [view, reconcileRoute])
 
-  const preview: FoundationPreview = {
-    sections: attempt.batch.sections.map((item) => ({
+  const basic: FoundationPreview = {
+    sections: source.batch.sections.map((item) => ({
       id: item.kind, label: sectionTitles[item.kind], count: item.questionIds.length,
-      state: attempt.locks.includes(item.kind) ? 'locked' : item.kind === kind ? 'current' : 'upcoming',
+      state: attempt?.locks.includes(item.kind) ? 'locked' : item.kind === section?.kind ? 'current' : 'upcoming',
     })),
-    activeSectionId: kind,
-    questions: section?.questionIds.map((id) => previewQuestion(id, attempt.optionOrder[id])) ?? [],
-    position: attempt.position,
-    answers: Object.fromEntries(Object.entries(attempt.answers).flatMap(([id, answer]) => answer ? [[id, asDisplay(answer)]] : [])),
-    marks: Object.entries(attempt.reviewMarks).filter(([, marked]) => marked).map(([id]) => id),
+    activeSectionId: section?.kind ?? '',
+    questions: [],
+    position: attempt?.position ?? 0,
     view,
-    context: kind.startsWith('CASE_STUDY') ? {
-      title: 'Sample context',
-      paragraphs: ['This demonstration shows where shared case material will appear. Only synthetic controls are included in the public engineering preview.'],
-    } : undefined,
-    status: { label: state.status, tone: state.notice ? 'warning' : 'neutral' },
-    readOnly: state.readOnly,
+    examTitle: source.examTitle,
+    synthetic: source.synthetic,
+    contentNotice: source.contentNotice,
+    status: { label: state.status, tone: state.error ? 'error' : state.notice ? 'warning' : 'neutral' },
+    readOnly: state.readOnly || view === 'error',
     notice: state.notice,
+    error: state.error ?? defaultError,
     canTakeOver: state.takeover,
     hasUnsavedChange: state.hasUnsavedChange,
     canRetrySave: state.canRetrySave,
   }
-  return <App preview={preview} onAction={(action) => dispatchRef.current(action)} />
+  const fallback = {
+    ...basic, view: 'error' as const, readOnly: true, canTakeOver: false, hasUnsavedChange: false, error: renderError,
+    status: { label: 'Content unavailable', tone: 'error' as const },
+  }
+  let preview = basic
+  let contentFailed = false
+  try {
+    if (active && attempt && (view === 'question' || view === 'review')) {
+      const questions = active.questionIds.map((id) => candidateQuestion(source, id))
+      preview = {
+        ...basic, questions,
+        context: active.caseStudyId ? source.context?.(active.caseStudyId) : undefined,
+        answers: Object.fromEntries(questions.flatMap(({ id, interaction }) => {
+          const display = readDisplayResponse(interaction, attempt.answers[id])
+          return display ? [[id, display]] : []
+        })),
+        marks: active.questionIds.filter((id) => attempt.reviewMarks[id] === true),
+      }
+    }
+    displayFailed.current = false
+  } catch {
+    displayFailed.current = true
+    contentFailed = true
+    preview = fallback
+  }
+  useEffect(() => {
+    if (contentFailed) abortDisplay.current()
+  }, [contentFailed])
+
+  return (
+    <CandidateDisplayBoundary fallback={<App preview={fallback} />} onError={() => abortDisplay.current()}>
+      <App preview={preview} onAction={(action) => dispatchRef.current(action)} />
+    </CandidateDisplayBoundary>
+  )
+}
+
+export function Foundation({ source = syntheticSource }: { readonly source?: FoundationSource } = {}) {
+  return <CandidateSession key={JSON.stringify([source.idbName, source.attemptId, source.batch.contentVersion])} source={source} />
 }

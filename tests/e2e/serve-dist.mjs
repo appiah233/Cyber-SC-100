@@ -5,7 +5,7 @@ import { extname, resolve, sep } from 'node:path'
 
 const prefix = '/Cyber-SC-100/'
 const port = Number(process.env.PLAYWRIGHT_STATIC_PORT ?? 4177)
-const root = await realpath(resolve('dist'))
+const root = await realpath(resolve(process.env.PLAYWRIGHT_STATIC_DIST_PATH ?? 'dist'))
 if (!(await stat(resolve(root, 'index.html'))).isFile()) {
   throw new Error('Build the application before testing the static output.')
 }

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { inspectPublicBoundary } from './public-boundary.mjs';
+import { comparePublicEmissions, inspectPublicGraph } from './verify-public-graph.mjs';
 
 async function withDirectory(run) {
   const dir = await mkdtemp(join(tmpdir(), 'exam-boundary-'));
@@ -126,4 +127,48 @@ test('keeps generated source-crop and review-output naming lanes out of public s
   assert.deepEqual((await inspectPublicBoundary(dir, 'source')).issues, [
     'restricted-file-path', 'restricted-file-path', 'restricted-file-path', 'unsupported-file-or-directory',
   ]);
+}));
+
+test('public entry graph must use the public HTML and boot module without private dependencies', () => withDirectory(async dir => {
+  const ordinary = [join(dir, 'index.html'), join(dir, 'src/main.tsx')];
+  assert.deepEqual(inspectPublicGraph(ordinary, dir), []);
+  for (const privateId of [
+    join(dir, 'src/integration/development-runner.tsx') + '?compiled',
+    join(dir, 'src/integration/development-module.d.ts'),
+    join(dir, 'src/data/development-bank.ts'),
+    join(dir, 'src/data/cycle-inventory.ts'),
+    join(dir, 'src/data/candidate-reference.ts'),
+    join(dir, 'scripts/question-bank/build-candidate.mjs'),
+    '\0' + ['virtual:', 'local-candidate-display'].join(''),
+  ]) {
+    assert.deepEqual(inspectPublicGraph([...ordinary, privateId], dir), ['private-module-in-public-graph']);
+  }
+  assert.deepEqual(inspectPublicGraph(ordinary.slice(1), dir), ['missing-expected-public-entry']);
+}));
+
+test('in-memory verification matches the exact ordinary dist and rejects unexpected scripts', () => withDirectory(async dir => {
+  const output = [
+    { type: 'asset', fileName: 'index.html', source: 'Synthetic entry' },
+    { type: 'chunk', fileName: 'assets/main.js', code: 'export const demo = 1;' },
+  ];
+  await write(dir, { 'index.html': output[0].source, 'assets/main.js': output[1].code });
+  assert.deepEqual(await comparePublicEmissions(output, dir), []);
+  await write(dir, { 'index.html': 'Unexpected entry', 'assets/unverified.js': '' });
+  assert.deepEqual(await comparePublicEmissions(output, dir), ['build-emission-mismatch', 'unexpected-dist-script']);
+  assert.deepEqual(await comparePublicEmissions([...output, { type: 'asset', fileName: '../outside', source: '' }], dir), [
+    'build-emission-mismatch', 'unapproved-build-emission', 'unexpected-dist-script',
+  ]);
+}));
+
+test('rejects a private candidate virtual module marker in otherwise allowed dist JavaScript', () => withDirectory(async dir => {
+  await write(dir, {
+    'index.html': '<script type="module" src="./assets/main.js"></script>',
+    'assets/main.js': 'export const marker = "' + ['virtual:', 'local-candidate-display'].join('') + '";',
+  });
+  assert.deepEqual((await inspectPublicBoundary(dir, 'dist')).issues, ['restricted-bundle-marker']);
+}));
+
+test('candidate visual evidence is not part of the public checkout', () => withDirectory(async dir => {
+  await write(dir, { 'phase5-evidence/screenshots/start.png': 'synthetic image marker' });
+  assert.deepEqual((await inspectPublicBoundary(dir, 'source')).issues, ['unsupported-file-or-directory']);
 }));

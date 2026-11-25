@@ -68,6 +68,7 @@ export interface RepositoryOptions<A extends AttemptSnapshot, C extends CycleSna
   readonly leaseDurationMs?: number;
   readonly validateAttempt?: (value: A) => boolean;
   readonly validateCycle?: (value: C) => boolean;
+  readonly validatePair?: (attempt: A, cycle: C) => boolean;
 }
 
 export interface InitializeExam<A extends AttemptSnapshot, C extends CycleSnapshot> {
@@ -315,6 +316,11 @@ export function createExamRepository<
     return { id, contentVersion: value.contentVersion, cycle: value.cycle, revision: value.revision };
   }
 
+  function checkPair(attempt: A, cycle: C): void {
+    const validate = options.validatePair;
+    if (validate) checkExtra({ attempt, cycle }, (pair) => validate(pair.attempt, pair.cycle));
+  }
+
   function issueLease(writerId: string, token: number, timestamp: number): WriterLease {
     const expiry = timestamp + duration;
     if (!text(writerId) || !revision(token) || token === 0 || !Number.isFinite(expiry)) {
@@ -335,6 +341,7 @@ export function createExamRepository<
       return run('readwrite', async (attempts, cycles) => {
         checkAttempt<A>(input.attempt, options.validateAttempt);
         checkCycle<C>(input.cycle, options.validateCycle);
+        checkPair(input.attempt, input.cycle);
         if (!text(input.contentVersion) || input.attempt.cycleId !== input.cycle.id) {
           throw new StorageError('CORRUPT');
         }
@@ -372,6 +379,7 @@ export function createExamRepository<
         if (!record) return null;
         const cycle = await readCycle(cycles, record.attempt.cycleId);
         if (!cycle || cycle.contentVersion !== record.contentVersion) throw new StorageError('CORRUPT');
+        checkPair(record.attempt, cycle.cycle);
         return {
           attempt: record.attempt,
           cycle: cycle.cycle,
@@ -418,6 +426,7 @@ export function createExamRepository<
         if (input.attempt.cycleId !== record.attempt.cycleId) throw new StorageError('CORRUPT');
         const current = await readCycle(cycles, record.attempt.cycleId);
         if (!current || current.contentVersion !== record.contentVersion) throw new StorageError('CORRUPT');
+        checkPair(record.attempt, current.cycle);
         if (input.cycleUpdate) {
           const { cycle, expectedRevision } = input.cycleUpdate;
           checkCycle<C>(cycle, options.validateCycle);
@@ -426,6 +435,7 @@ export function createExamRepository<
           if (current.revision !== expectedRevision) throw new StorageError('CYCLE_CONFLICT');
           await requestResult(cycles.put({ ...current, cycle, revision: nextRevision(current.revision) }));
         }
+        checkPair(input.attempt, input.cycleUpdate?.cycle ?? current.cycle);
         const renewedLease = issueLease(input.lease.writerId, input.lease.token, timestamp);
         await requestResult(attempts.put({ ...record, attempt: input.attempt, lease: renewedLease }));
         const persisted = await readAttempt(attempts, record.id);
